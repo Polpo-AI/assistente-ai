@@ -1,0 +1,23 @@
+# Dipendenze Polpo Mail Intelligence
+# Generato: 2026-03-03
+# Per installare: pip install -r requirements.txt
+
+# API FastAPI e server
+fastapi==0.110.1
+uvicorn==0.25.0
+python-multipart==0.0.22
+starlette==0.37.2
+pydantic==2.12.5
+
+# LLM
+anthropic==0.84.0
+
+# Database
+supabase==2.28.0
+
+# Telegram Bot
+python-telegram-bot==21.10
+
+# Utilities
+python-dotenv==1.2.1
+httpx==0.28.1
