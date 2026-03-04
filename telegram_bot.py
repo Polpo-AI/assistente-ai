@@ -127,6 +127,27 @@ async def notify_draft(draft_id: str) -> None:
                     draft_id[:8], chat_id, msg_id)
 
 
+async def update_card_sent(chat_id: str, message_id: int, draft: dict) -> None:
+    """
+    Aggiorna la card Telegram con lo stato finale "📨 Inviata!"
+    dopo che il worker SMTP ha confermato l'invio reale.
+    """
+    email = draft.get("emails") or {}
+    to_address = email.get("sender_email", "")
+    text = _format_message(draft) + f"\n\n📨 *Email inviata a {to_address}!*"
+    await _edit_message(chat_id, message_id, text)
+    logger.info("update_card_sent | chat_id=%s msg_id=%s → inviata", chat_id, message_id)
+
+
+async def update_card_failed(chat_id: str, message_id: int, draft: dict, error: str) -> None:
+    """
+    Aggiorna la card Telegram segnalando un errore di invio SMTP.
+    """
+    text = _format_message(draft) + f"\n\n❌ *Invio fallito* — errore SMTP:\n`{error[:200]}`\n\nVerifica le credenziali SMTP o riprova dalla dashboard."
+    await _edit_message(chat_id, message_id, text)
+    logger.error("update_card_failed | chat_id=%s msg_id=%s → errore: %s", chat_id, message_id, error[:80])
+
+
 # ─────────────────────────────────────────────
 # Gestione update in arrivo dal webhook
 # ─────────────────────────────────────────────
@@ -163,19 +184,33 @@ async def _handle_callback(cq: dict) -> None:
         await _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": "Errore: Bozza non trovata", "show_alert": True})
         return
 
-    # Gestione conflitti: bozza già gestita da altro canale
+    # Gestione conflitti: bozza già gestita — aggiorna la card con lo stato reale
     if draft.get("status") != "pending":
-        await _edit_message(chat_id, message_id, "⚠️ Questa email è già stata gestita.")
-        await _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": "Già gestita!", "show_alert": False})
-        logger.info("callback | draft_id=%s già in stato '%s' — conflitto ignorato",
-                    draft_id[:8], draft.get("status"))
+        status = draft.get("status", "")
+        status_labels = {
+            "approved":  "⏳ Invio in corso...",
+            "sent":      "📨 Email inviata!",
+            "ignored":   "🗑 Email ignorata.",
+            "send_failed": "❌ Invio fallito — verifica le credenziali SMTP o riprova dalla dashboard.",
+        }
+        label = status_labels.get(status, f"⚠️ Già gestita ({status}).")
+        await _edit_message(chat_id, message_id, _format_message(draft) + f"\n\n{label}")
+        await _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": label, "show_alert": False})
+        logger.info("callback | draft_id=%s già in stato '%s' — card aggiornata",
+                    draft_id[:8], status)
         return
 
     if action == "invia":
         try:
+            # Stato intermedio: rimuovi bottoni e mostra "Invio in corso..."
+            await _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": "⏳ Invio in corso...", "show_alert": False})
+            await _edit_message_with_buttons(
+                chat_id, message_id,
+                _format_message(draft) + "\n\n⏳ _Invio in corso..._",
+                {"inline_keyboard": []}
+            )
             approve_draft(draft_id, approved_by="telegram")
-            await _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": "🚀 Invio in corso...", "show_alert": False})
-            await _edit_message(chat_id, message_id, "✅ Bozza inviata con successo.")
+            # Lo stato finale "📨 Inviata!" arriverà da update_card_sent() nel worker SMTP
             logger.info("callback | draft_id=%s approvata da Telegram", draft_id[:8])
         except Exception as e:
             await _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": "❌ Errore durante l'invio", "show_alert": True})
@@ -185,22 +220,28 @@ async def _handle_callback(cq: dict) -> None:
         try:
             ignore_draft(draft_id)
             await _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": "🗑 Email ignorata", "show_alert": False})
-            await _edit_message(chat_id, message_id, "🗑 Email ignorata.")
+            await _edit_message(chat_id, message_id, _format_message(draft) + "\n\n🗑 *Email ignorata.*")
             logger.info("callback | draft_id=%s ignorata da Telegram", draft_id[:8])
         except Exception as e:
             await _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": "❌ Errore", "show_alert": True})
 
     elif action == "snooze":
-        await _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": "⏸ Rimandata", "show_alert": False})
-        await _edit_message(chat_id, message_id, "⏸ Lasciata per dopo — gestisci dalla dashboard.")
+        await _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": "⏸ Rimandato", "show_alert": False})
+        await _edit_message(chat_id, message_id, _format_message(draft) + "\n\n⏸ *Lasciato per dopo* — gestisci dalla dashboard.")
         logger.info("callback | draft_id=%s snooze, bottoni rimossi", draft_id[:8])
 
     elif action == "modifica":
         await _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": "✏️ Modalità modifica", "show_alert": False})
         _pending_edits[str(chat_id)] = draft_id
+        # Feedback immediato sulla card: rimuovi bottoni, mostra stato modifica
+        await _edit_message_with_buttons(
+            chat_id, message_id,
+            _format_message(draft) + "\n\n✏️ _In attesa di istruzioni di modifica..._",
+            {"inline_keyboard": []}
+        )
         await _tg_post("sendMessage", {
-            "chat_id": chat_id,
-            "text":    "✏️ *Scrivi la modifica da fare:*\n(es: 'aggiungi uno sconto del 10%')",
+            "chat_id":    chat_id,
+            "text":       "✏️ *Cosa vuoi modificare?*\n\nScrivi qui sotto le istruzioni per l'AI.\n_(es: 'aggiungi uno sconto del 10%', 'tono più formale')_",
             "parse_mode": "Markdown"
         })
         logger.info("callback | draft_id=%s in attesa istruzione modifica", draft_id[:8])
@@ -389,10 +430,23 @@ async def _process_conversational_query(chat_id: str, text: str) -> None:
 # Helper: edit messaggio esistente
 # ─────────────────────────────────────────────
 
-def _edit_message(chat_id, message_id: int, text: str) -> None:
+async def _edit_message(chat_id, message_id: int, text: str) -> None:
     """Edita un messaggio esistente rimuovendo i bottoni."""
-    _tg_post("editMessageText", {
-        "chat_id":    chat_id,
-        "message_id": message_id,
-        "text":       text,
+    await _tg_post("editMessageText", {
+        "chat_id":      chat_id,
+        "message_id":   message_id,
+        "text":         text,
+        "parse_mode":   "Markdown",
+        "reply_markup": {"inline_keyboard": []},
+    })
+
+
+async def _edit_message_with_buttons(chat_id, message_id: int, text: str, reply_markup: dict) -> None:
+    """Edita un messaggio esistente aggiornando testo e bottoni."""
+    await _tg_post("editMessageText", {
+        "chat_id":      chat_id,
+        "message_id":   message_id,
+        "text":         text,
+        "parse_mode":   "Markdown",
+        "reply_markup": reply_markup,
     })

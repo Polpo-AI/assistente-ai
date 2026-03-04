@@ -99,9 +99,9 @@ def get_approved_drafts() -> list[dict]:
     db = get_db()
     result = (
         db.table("draft_responses")
-        .select("id, client_id, subject, body, email_id, "
+        .select("id, client_id, subject, body, email_id, telegram_message_id, "
                 "emails(sender_email, sender_name, subject), "
-                "clients(smtp_host, smtp_port, smtp_user, smtp_password, name)")
+                "clients(smtp_host, smtp_port, smtp_user, smtp_password, name, telegram_chat_id)")
         .eq("status", "approved")
         .execute()
     )
@@ -431,10 +431,22 @@ async def send_email_smtp(draft: dict) -> None:
         mark_draft_sent(draft_id)
         logger.info("worker.smtp | ✓ Inviata → draft=%s a <%s>", draft_id, to_address)
 
+        # Aggiorna la card Telegram con stato finale "📨 Inviata!" (solo se la card esiste)
+        tg_msg_id  = draft.get("telegram_message_id")
+        tg_chat_id = client_smtp.get("telegram_chat_id")
+        if tg_msg_id and tg_chat_id:
+            await telegram_bot.update_card_sent(tg_chat_id, tg_msg_id, draft)
+
     except Exception as e:
         err = str(e)
         logger.error("worker.smtp | ✗ Fallita → draft=%s: %s", draft_id, err)
         mark_draft_failed(draft_id, err)
+
+        # Aggiorna la card Telegram segnalando il fallimento
+        tg_msg_id  = draft.get("telegram_message_id")
+        tg_chat_id = client_smtp.get("telegram_chat_id")
+        if tg_msg_id and tg_chat_id:
+            await telegram_bot.update_card_failed(tg_chat_id, tg_msg_id, draft, err)
 
 
 # ─────────────────────────────────────────────
