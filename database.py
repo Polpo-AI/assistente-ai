@@ -93,6 +93,19 @@ def get_contact_by_email(client_id: str, email: str) -> Optional[dict]:
     return result.data[0] if result.data else None
 
 
+def get_existing_contact_types(client_id: str) -> list[str]:
+    """Restituisce i valori distinti di contact_type già usati per questo cliente."""
+    db = get_client()
+    result = (
+        db.table("contacts")
+        .select("contact_type")
+        .eq("client_id", client_id)
+        .execute()
+    )
+    types = list({r["contact_type"] for r in result.data if r.get("contact_type")})
+    return sorted(types)
+
+
 # ─────────────────────────────────────────────
 # CONVERSATIONS
 # ─────────────────────────────────────────────

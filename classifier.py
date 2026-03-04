@@ -131,7 +131,7 @@ def apply_rules(msg: InboundMessage, config: ClientConfig) -> Optional[Classific
     # Priorità 0 — Mittenti automatici/noreply: non rispondere
     if any(re.search(p, sender) for p in NOREPLY_PATTERNS):
         return ClassificationResult(
-            contact_type="automatico",
+            contact_type="sconosciuto",
             intent="cortesia",
             priority=0,
             confidence=0.99,
@@ -201,12 +201,17 @@ def apply_rules(msg: InboundMessage, config: ClientConfig) -> Optional[Classific
 # Livello 3 — LLM Haiku (con config cliente)
 # ─────────────────────────────────────────────
 
-def _build_llm_prompt(config: ClientConfig) -> str:
+def _build_llm_prompt(config: ClientConfig, existing_contact_types: list[str] = None) -> str:
     """Costruisce il system prompt dinamicamente dalla config del cliente."""
+    if existing_contact_types:
+        contact_type_hint = f"Valori contact_type già usati per questo cliente (preferisci questi se appropriato): {', '.join(existing_contact_types)}"
+    else:
+        contact_type_hint = "Esempi comuni: cliente, fornitore, spam, personale, sconosciuto"
+
     return f"""{config.llm_persona}
 Analizza il messaggio email e rispondi SOLO con un JSON valido:
 {{
-  "contact_type": "cliente" | "fornitore" | "spam" | "personale" | "sconosciuto",
+  "contact_type": stringa libera che descrive il tipo di contatto ({contact_type_hint}),
   "intent": {config.all_intents_str()} | "spam",
   "priority": 0 | 1 | 2 | 3,
   "confidence": 0.0-1.0,
@@ -237,6 +242,9 @@ def classify_with_llm(
     client: Anthropic,
 ) -> ClassificationResult:
     """Classificazione via Haiku — solo quando regole e DB non bastano."""
+    from database import get_existing_contact_types
+    existing_contact_types = get_existing_contact_types(config.client_id)
+
     user_content = f"""
 Da: {msg.sender_name} <{msg.sender_email}>
 Oggetto: {msg.subject}
@@ -250,7 +258,7 @@ Allegati: {', '.join(msg.attachments) if msg.attachments else 'nessuno'}
         model=CLASSIFIER_MODEL,
         max_tokens=300,
         timeout=30.0,
-        system=_build_llm_prompt(config),
+        system=_build_llm_prompt(config, existing_contact_types),
         messages=[{"role": "user", "content": user_content}]
     )
 
@@ -269,6 +277,7 @@ Allegati: {', '.join(msg.attachments) if msg.attachments else 'nessuno'}
         intent = data.get("intent", "altro")
         if intent not in config.intent_list:
             intent = "altro"
+
         result = ClassificationResult(
             contact_type=data.get("contact_type", "sconosciuto"),
             intent=intent,
