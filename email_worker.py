@@ -261,8 +261,19 @@ async def fetch_new_emails_imap(client: dict) -> list[dict]:
                     logger.warning("worker.imap | [%s] Email UID %d troncata da %d a 30000 caratteri", client["name"], uid, len(body))
                     body = body[:30000] + "\n\n[...Testo troncato: troppo lungo...]"
 
-                # Salta email vuote o bounce di sistema
+                # Salta email vuote o bounce di sistema, ma traccia l'UID
                 if not body or sender_email.startswith("mailer-daemon@") or sender_email.startswith("postmaster@"):
+                    logger.info("worker.imap | [%s] Skip UID %d (mailer-daemon/postmaster/vuota)", client["name"], uid)
+                    emails_found.append({
+                        "uid":          uid,
+                        "sender_email": sender_email,
+                        "sender_name":  sender_name,
+                        "subject":      subject,
+                        "body":         "",
+                        "message_id":   message_id,
+                        "folder":       folder,
+                        "_skip":        True,
+                    })
                     continue
 
                 emails_found.append({
@@ -458,12 +469,16 @@ async def imap_polling_loop() -> None:
 
                     for email_data in new_emails:
                         email_data["_client_name"] = client_name
+                        # Email marcate _skip (mailer-daemon, postmaster, vuote):
+                        # non processare ma aggiorna max_uid per non riprocessarle
+                        if email_data.get("_skip"):
+                            max_uid = max(max_uid, email_data["uid"])
+                            continue
                         try:
-                            # Processamento asincrono dell'email
                             await process_email(client_id, email_data)
                             max_uid = max(max_uid, email_data["uid"])
                         except Exception as inner_e:
-                            logger.error("worker.imap | [%s] Errore processamento email UID %s: %s", 
+                            logger.error("worker.imap | [%s] Errore processamento email UID %s: %s",
                                          client_name, email_data.get("uid"), inner_e)
 
                     # Aggiorna UID solo dopo aver processato tutto il batch
