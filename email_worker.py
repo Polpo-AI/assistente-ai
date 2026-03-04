@@ -172,23 +172,41 @@ async def fetch_new_emails_imap(client: dict) -> list[dict]:
             if select_res[0] != 'OK':
                 continue
 
-            # Cerca direttamente solo i UID > last_uid (evita di scaricare email già processate)
-            # UID SEARCH UID N:* ritorna solo i messaggi con UID >= N, mai quelli vecchi
-            search_uid_from = last_uid + 1
-            _, data = await imap.uid("search", f"UID {search_uid_from}:*")
-            uid_list = [u for u in data[0].decode().split() if u.strip()]
+            # Recupera tutti i numeri di sequenza e scansiona dalla fine
+            # fermandosi appena troviamo UID <= last_uid (già processati)
+            import re as _re
+            _, data = await imap.search("ALL")
+            seq_list = [s for s in data[0].decode().split() if s.strip()]
 
-            if not uid_list:
+            if not seq_list:
+                logger.info("worker.imap | [%s] Nessuna email in %s", client["name"], folder)
+                continue
+
+            # Scorri dalla più recente, fermati al primo già processato
+            new_seqs = []
+            for seq_str in reversed(seq_list):
+                _, hdr_data = await imap.fetch(seq_str, "(UID)")
+                uid = None
+                for part in hdr_data:
+                    if isinstance(part, (bytes, bytearray)):
+                        m = _re.search(rb"UID (\d+)", bytes(part))
+                        if m:
+                            uid = int(m.group(1))
+                            break
+                if uid is None or uid <= last_uid:
+                    break
+                new_seqs.append((seq_str, uid))
+
+            new_seqs = list(reversed(new_seqs))  # ordina dal più vecchio
+            if not new_seqs:
                 logger.info("worker.imap | [%s] Nessuna nuova email in %s (last_uid=%d)", client["name"], folder, last_uid)
                 continue
 
-            logger.info("worker.imap | [%s] %d nuove email in %s (UID > %d)", client["name"], len(uid_list), folder, last_uid)
+            logger.info("worker.imap | [%s] %d nuove email in %s", client["name"], len(new_seqs), folder)
 
-            for uid_str in uid_list:
-                uid = int(uid_str)
-
-                # Scarica il corpo via UID FETCH (non sequence number)
-                _, msg_data = await imap.uid("fetch", uid_str, "(RFC822)")
+            for seq_str, uid in new_seqs:
+                # Scarica il corpo completo
+                _, msg_data = await imap.fetch(seq_str, "(RFC822)")
                 if not msg_data:
                     logger.warning("worker.imap | [%s] Nessun dato per UID %d", client["name"], uid)
                     continue
