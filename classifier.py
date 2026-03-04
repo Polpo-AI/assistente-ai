@@ -131,7 +131,7 @@ def apply_rules(msg: InboundMessage, config: ClientConfig) -> Optional[Classific
     # Priorità 0 — Mittenti automatici/noreply: non rispondere
     if any(re.search(p, sender) for p in NOREPLY_PATTERNS):
         return ClassificationResult(
-            contact_type="sconosciuto",
+            contact_type="automatico",
             intent="cortesia",
             priority=0,
             confidence=0.99,
@@ -140,10 +140,14 @@ def apply_rules(msg: InboundMessage, config: ClientConfig) -> Optional[Classific
         )
 
     # Priorità 0 — Messaggi di cortesia non azionabili
+    # Scatta solo se: body corto E contiene cortesia E NON contiene parole azionabili
+    ACTIONABLE_PATTERN = r"\b(preventivo|spedizione|tracking|ritiro|consegna|tariffa|prezzo|costo|pacco|ordine|fattura|pagamento|reclamo|problema|urgente|appuntamento|informazioni?|richiesta|aiuto)\b"
     body_short = msg.body.strip()
-    if len(body_short) < 120 and re.search(CORTESIA_PATTERN, text, re.IGNORECASE):
+    if (len(body_short) < 120
+            and re.search(CORTESIA_PATTERN, text, re.IGNORECASE)
+            and not re.search(ACTIONABLE_PATTERN, text, re.IGNORECASE)):
         return ClassificationResult(
-            contact_type="cliente",
+            contact_type="sconosciuto",
             intent="cortesia",
             priority=0,
             confidence=0.90,
@@ -201,17 +205,17 @@ def apply_rules(msg: InboundMessage, config: ClientConfig) -> Optional[Classific
 # Livello 3 — LLM Haiku (con config cliente)
 # ─────────────────────────────────────────────
 
-def _build_llm_prompt(config: ClientConfig, existing_contact_types: list[str] = None) -> str:
+def _build_llm_prompt(config: ClientConfig, existing_contact_types: list = None) -> str:
     """Costruisce il system prompt dinamicamente dalla config del cliente."""
     if existing_contact_types:
-        contact_type_hint = f"Valori contact_type già usati per questo cliente (preferisci questi se appropriato): {', '.join(existing_contact_types)}"
+        contact_type_hint = f"Valori già usati per questo cliente (preferisci questi se appropriato): {', '.join(existing_contact_types)}"
     else:
-        contact_type_hint = "Esempi comuni: cliente, fornitore, spam, personale, sconosciuto"
+        contact_type_hint = "es: cliente, fornitore, partner, candidato, istituzione"
 
     return f"""{config.llm_persona}
 Analizza il messaggio email e rispondi SOLO con un JSON valido:
 {{
-  "contact_type": stringa libera che descrive il tipo di contatto ({contact_type_hint}),
+  "contact_type": chi è strutturalmente il mittente come soggetto (NON l'intent della mail — NON usare mai valori come 'cortesia', 'spam', 'informazione' che descrivono il contenuto; usa invece il ruolo del mittente, {contact_type_hint}),
   "intent": {config.all_intents_str()} | "spam",
   "priority": 0 | 1 | 2 | 3,
   "confidence": 0.0-1.0,
@@ -277,7 +281,6 @@ Allegati: {', '.join(msg.attachments) if msg.attachments else 'nessuno'}
         intent = data.get("intent", "altro")
         if intent not in config.intent_list:
             intent = "altro"
-
         result = ClassificationResult(
             contact_type=data.get("contact_type", "sconosciuto"),
             intent=intent,
