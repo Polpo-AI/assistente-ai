@@ -10,9 +10,10 @@ Modelli:
 """
 
 import logging
-from typing import Optional
+from typing import Optional, List
 from anthropic import Anthropic
 from models_config import SUMMARIZER_MODEL
+from duckduckgo_search import DDGS
 
 import database as db
 from responder import generate_response_draft
@@ -220,6 +221,18 @@ TOOLS = [
             "required": ["user_message"],
         },
     },
+    {
+        "name": "search_web",
+        "description": "Cerca informazioni aggiornate su internet (es. numeri di telefono, siti web, notizie).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "La query di ricerca"},
+                "max_results": {"type": "integer", "description": "Numero di risultati (default: 5)"},
+            },
+            "required": ["query"],
+        },
+    },
 ]
 
 
@@ -338,8 +351,9 @@ def dispatch(tool_name: str, tool_input: dict, client_id: str, anthropic_client:
                 return "Generazione della bozza fallita o email già con bozza pending in corso."
 
         elif tool_name == "report_unsupported_feature":
-            # Questo tool verrà intercettato da telegram_bot.py per passare la history
-            return "SUCCESS: Notifica inviata al developer."
+            return "OK" # Gestito esternamente in telegram_bot.py
+        elif tool_name == "search_web":
+            return _search_web(tool_input.get("query"), tool_input.get("max_results", 5))
 
         else:
             return f"Tool '{tool_name}' non riconosciuto."
@@ -347,6 +361,32 @@ def dispatch(tool_name: str, tool_input: dict, client_id: str, anthropic_client:
     except Exception as e:
         logger.error("dispatch | tool=%s errore: %s", tool_name, e)
         return f"Errore nell'esecuzione di {tool_name}: {e}"
+
+
+# ─────────────────────────────────────────────
+# Search Web (DuckDuckGo)
+# ─────────────────────────────────────────────
+
+def _search_web(query: str, max_results: int = 5) -> str:
+    """Esegue una ricerca web tramite DuckDuckGo."""
+    try:
+        logger.info(f"web_search | query='{query}'")
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=max_results))
+            if not results:
+                return f"Nessun risultato trovato per '{query}'."
+            
+            lines = [f"Risultati per: {query}\n"]
+            for i, r in enumerate(results, 1):
+                title = r.get("title", "Senza titolo")
+                snippet = r.get("body", r.get("snippet", ""))
+                link = r.get("href", r.get("link", ""))
+                lines.append(f"{i}. {title}\n   {snippet}\n   URL: {link}")
+            
+            return "\n\n".join(lines)
+    except Exception as e:
+        logger.error(f"Errore web_search: {e}")
+        return f"Errore durante la ricerca web: {str(e)}"
 
 
 # ─────────────────────────────────────────────

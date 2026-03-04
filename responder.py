@@ -22,6 +22,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Optional
 from anthropic import Anthropic
+import anthropic
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from dotenv import load_dotenv
 from database import get_client, get_conversation_history, save_draft, get_draft_by_id, update_draft_body
@@ -119,6 +121,12 @@ def load_email_context(email_id: str) -> Optional[EmailContext]:
 # Step 2 — Riclassifica con Sonnet
 # ─────────────────────────────────────────────
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type((anthropic.APIError, anthropic.APIConnectionError, anthropic.RateLimitError)),
+    before_sleep=lambda retry_state: logger.warning(f"Retrying LLM reclassification... Attempt {retry_state.attempt_number}")
+)
 def reclassify_with_sonnet(
     ctx: EmailContext,
     config: ClientConfig,
@@ -193,6 +201,12 @@ Allegati: {', '.join(ctx.attachments) if ctx.attachments else 'nessuno'}
 # Step 3 — Genera bozza con Sonnet
 # ─────────────────────────────────────────────
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type((anthropic.APIError, anthropic.APIConnectionError, anthropic.RateLimitError)),
+    before_sleep=lambda retry_state: logger.warning(f"Retrying LLM draft generation... Attempt {retry_state.attempt_number}")
+)
 def generate_draft(
     ctx: EmailContext,
     config: ClientConfig,
@@ -212,8 +226,11 @@ def generate_draft(
             history_text += f"[{prev.get('received_at','')[:10]}] {prev.get('body','')[:300]}\n---\n"
 
     system = f"""{config.llm_persona}
-Sei il segretario virtuale di {config.name}.
+Sei il segretario virtuale di {config.name}, azienda che opera nel settore: {config.sector}.
 Scrivi bozze di email che verranno revisionate da un umano prima dell'invio.
+
+REGOLA FONDAMENTALE (OUT-OF-SCOPE): 
+Se la richiesta dell'utente è COMPLETAMENTE estranea al settore aziendale ({config.sector}) - ad esempio richieste per servizi web, marketing, o fornitura di beni non attinenti - DEVI informare cortesemente il mittente che l'azienda si occupa esclusivamente del proprio settore e non offre i servizi o prodotti richiesti. NON generare MAI un finto preventivo o una risposta per un servizio che l'azienda non offre.
 
 Stile: {config.llm_tone}
 Apertura: "Gentile [Nome],"

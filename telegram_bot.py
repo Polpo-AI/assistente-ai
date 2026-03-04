@@ -49,25 +49,16 @@ logger = logging.getLogger("polpo.telegram")
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# Mappa draft_id → utente in attesa di istruzione modifica
-# { chat_id: draft_id }  (in memoria, senza Redis per ora)
-_pending_edits: dict[str, str] = {}
-
-# Storico conversazioni: { chat_id: [MessageParam] } max 5 messaggi per chat_id
-_conversations: dict[str, list[MessageParam]] = {}
-
-
-
-# ─────────────────────────────────────────────
 # Helpers HTTP
 # ─────────────────────────────────────────────
 
-def _tg_post(method: str, payload: dict) -> dict:
-    """Chiama l'API Telegram in modo sincrono."""
+async def _tg_post(method: str, payload: dict) -> dict:
+    """Chiama l'API Telegram in modo asincrono."""
     try:
-        r = httpx.post(f"{TELEGRAM_API}/{method}", json=payload, timeout=10.0)
-        r.raise_for_status()
-        return r.json()
+        async with httpx.AsyncClient() as client:
+            r = await client.post(f"{TELEGRAM_API}/{method}", json=payload, timeout=15.0)
+            r.raise_for_status()
+            return r.json()
     except Exception as e:
         logger.error("telegram | %s fallita: %s", method, e)
         return {}
@@ -105,7 +96,7 @@ def _format_message(draft: dict) -> str:
 # Notifica push quando arriva una nuova bozza
 # ─────────────────────────────────────────────
 
-def notify_draft(draft_id: str) -> None:
+async def notify_draft(draft_id: str) -> None:
     """
     Invia il messaggio Telegram al tenant corretto.
     Chiamato da main.py dopo la classificazione (priority >= 2).
@@ -122,44 +113,44 @@ def notify_draft(draft_id: str) -> None:
         return
 
     text = _format_message(draft)
-    resp = _tg_post("sendMessage", {
+    res = await _tg_post("sendMessage", {
         "chat_id":    chat_id,
         "text":       text,
         "parse_mode": "Markdown",
         "reply_markup": _build_buttons(draft_id),
     })
 
-    message_id = resp.get("result", {}).get("message_id")
-    if message_id:
-        save_telegram_message_id(draft_id, message_id)
+    if res.get("ok"):
+        msg_id = res["result"]["message_id"]
+        save_telegram_message_id(draft_id, msg_id)
         logger.info("notify_draft | draft_id=%s inviato su chat_id=%s msg_id=%s",
-                    draft_id[:8], chat_id, message_id)
+                    draft_id[:8], chat_id, msg_id)
 
 
 # ─────────────────────────────────────────────
 # Gestione update in arrivo dal webhook
 # ─────────────────────────────────────────────
 
-def handle_update(data: dict) -> None:
+async def handle_update(data: dict) -> None:
     """
     Router principale per gli update Telegram.
     Chiamato da POST /telegram/webhook in main.py.
     """
     if "callback_query" in data:
-        _handle_callback(data["callback_query"])
+        await _handle_callback(data["callback_query"])
     elif "message" in data:
-        _handle_message(data["message"])
+        await _handle_message(data["message"])
 
 
-def _handle_callback(cq: dict) -> None:
+async def _handle_callback(cq: dict) -> None:
     """Gestisce i click sui bottoni inline."""
     callback_id = cq.get("id")
     raw_data    = cq.get("data", "")
     chat_id     = cq.get("message", {}).get("chat", {}).get("id")
     message_id  = cq.get("message", {}).get("message_id")
 
-    # Risponde subito a Telegram per togliere il loader
-    _tg_post("answerCallbackQuery", {"callback_query_id": callback_id})
+    # Risponde SUBITO a Telegram per togliere il loader il prima possibile
+    await _tg_post("answerCallbackQuery", {"callback_query_id": callback_id})
 
     if ":" not in raw_data:
         return
@@ -168,46 +159,46 @@ def _handle_callback(cq: dict) -> None:
     draft = get_draft_by_id(draft_id)
 
     if not draft:
-        _edit_message(chat_id, message_id, "⚠️ Bozza non trovata.")
-        _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": "Errore: Bozza non trovata", "show_alert": True})
+        await _edit_message(chat_id, message_id, "⚠️ Bozza non trovata.")
+        await _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": "Errore: Bozza non trovata", "show_alert": True})
         return
 
     # Gestione conflitti: bozza già gestita da altro canale
     if draft.get("status") != "pending":
-        _edit_message(chat_id, message_id, "⚠️ Questa email è già stata gestita.")
-        _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": "Già gestita!", "show_alert": False})
+        await _edit_message(chat_id, message_id, "⚠️ Questa email è già stata gestita.")
+        await _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": "Già gestita!", "show_alert": False})
         logger.info("callback | draft_id=%s già in stato '%s' — conflitto ignorato",
-                    draft_id[:8], draft.get("status"])
+                    draft_id[:8], draft.get("status"))
         return
 
     if action == "invia":
         try:
             approve_draft(draft_id, approved_by="telegram")
-            _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": "🚀 Invio in corso...", "show_alert": False})
-            _edit_message(chat_id, message_id, "✅ Bozza inviata con successo.")
+            await _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": "🚀 Invio in corso...", "show_alert": False})
+            await _edit_message(chat_id, message_id, "✅ Bozza inviata con successo.")
             logger.info("callback | draft_id=%s approvata da Telegram", draft_id[:8])
         except Exception as e:
-            _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": "❌ Errore durante l'invio", "show_alert": True})
+            await _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": "❌ Errore durante l'invio", "show_alert": True})
             logger.error("callback | errore invia: %s", e)
 
     elif action == "ignora":
         try:
             ignore_draft(draft_id)
-            _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": "🗑 Email ignorata", "show_alert": False})
-            _edit_message(chat_id, message_id, "🗑 Email ignorata.")
+            await _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": "🗑 Email ignorata", "show_alert": False})
+            await _edit_message(chat_id, message_id, "🗑 Email ignorata.")
             logger.info("callback | draft_id=%s ignorata da Telegram", draft_id[:8])
         except Exception as e:
-            _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": "❌ Errore", "show_alert": True})
+            await _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": "❌ Errore", "show_alert": True})
 
     elif action == "snooze":
-        _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": "⏸ Rimandata", "show_alert": False})
-        _edit_message(chat_id, message_id, "⏸ Lasciata per dopo — gestisci dalla dashboard.")
+        await _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": "⏸ Rimandata", "show_alert": False})
+        await _edit_message(chat_id, message_id, "⏸ Lasciata per dopo — gestisci dalla dashboard.")
         logger.info("callback | draft_id=%s snooze, bottoni rimossi", draft_id[:8])
 
     elif action == "modifica":
-        _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": "✏️ Modalità modifica", "show_alert": False})
+        await _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": "✏️ Modalità modifica", "show_alert": False})
         _pending_edits[str(chat_id)] = draft_id
-        _tg_post("sendMessage", {
+        await _tg_post("sendMessage", {
             "chat_id": chat_id,
             "text":    "✏️ *Scrivi la modifica da fare:*\n(es: 'aggiungi uno sconto del 10%')",
             "parse_mode": "Markdown"
@@ -215,7 +206,7 @@ def _handle_callback(cq: dict) -> None:
         logger.info("callback | draft_id=%s in attesa istruzione modifica", draft_id[:8])
 
 
-def _handle_message(msg: dict) -> None:
+async def _handle_message(msg: dict) -> None:
     """
     Gestisce testo libero inviato dall'operatore.
     Se è in attesa di modifica bozza, elabora la modifica.
@@ -229,20 +220,20 @@ def _handle_message(msg: dict) -> None:
 
     # 1. È una modifica bozza in corso?
     if chat_id in _pending_edits:
-        _process_draft_edit(chat_id, text)
+        await _process_draft_edit(chat_id, text)
         return
 
     # 2. Assistente Conversazionale
-    _process_conversational_query(chat_id, text)
+    await _process_conversational_query(chat_id, text)
 
 
-def _process_draft_edit(chat_id: str, instruction: str) -> None:
+async def _process_draft_edit(chat_id: str, instruction: str) -> None:
     """Modifica bozza e rimanda con bottoni."""
     draft_id = _pending_edits.pop(chat_id)
     logger.info("modifica | draft_id=%s istruzione ricevuta: %s", draft_id[:8], instruction[:50])
 
     # Notifica "Lavoro in corso"
-    wait_msg = _tg_post("sendMessage", {"chat_id": chat_id, "text": "⏳ _Sto elaborando la modifica..._", "parse_mode": "Markdown"})
+    wait_msg = await _tg_post("sendMessage", {"chat_id": chat_id, "text": "⏳ _Sto elaborando la modifica..._", "parse_mode": "Markdown"})
     wait_msg_id = wait_msg.get("result", {}).get("message_id")
 
     anthropic_client = Anthropic()
@@ -250,18 +241,18 @@ def _process_draft_edit(chat_id: str, instruction: str) -> None:
 
     if not res:
         if wait_msg_id:
-            _tg_post("deleteMessage", {"chat_id": chat_id, "message_id": wait_msg_id})
-        _tg_post("sendMessage", {"chat_id": chat_id, "text": "⚠️ *Errore nella modifica.* Il server non ha risposto correttamente. Riprova tra poco.", "parse_mode": "Markdown"})
+            await _tg_post("deleteMessage", {"chat_id": chat_id, "message_id": wait_msg_id})
+        await _tg_post("sendMessage", {"chat_id": chat_id, "text": "⚠️ *Errore nella modifica.* Il server non ha risposto correttamente. Riprova tra poco.", "parse_mode": "Markdown"})
         return
 
     new_sub, new_body, feedback = res
 
     # Rimuovi messaggio di attesa
     if wait_msg_id:
-        _tg_post("deleteMessage", {"chat_id": chat_id, "message_id": wait_msg_id})
+        await _tg_post("deleteMessage", {"chat_id": chat_id, "message_id": wait_msg_id})
 
     # 1. Invia Feedback IA personalizzato
-    _tg_post("sendMessage", {
+    await _tg_post("sendMessage", {
         "chat_id": chat_id,
         "text": f"✨ *Polpo AI:* {feedback}",
         "parse_mode": "Markdown"
@@ -270,7 +261,7 @@ def _process_draft_edit(chat_id: str, instruction: str) -> None:
     # 2. Rimanda la card aggiornata
     draft = get_draft_by_id(draft_id)
     if draft:
-        _tg_post("sendMessage", {
+        await _tg_post("sendMessage", {
             "chat_id": chat_id,
             "text": _format_message(draft),
             "parse_mode": "Markdown",
@@ -279,24 +270,31 @@ def _process_draft_edit(chat_id: str, instruction: str) -> None:
         logger.info("modifica | draft_id=%s rimandato aggiornato", draft_id[:8])
 
 
-def _process_conversational_query(chat_id: str, text: str) -> None:
+async def _process_conversational_query(chat_id: str, text: str) -> None:
     """
     Loop function calling con Claude: riceve domanda, invoca query (se necessario),
     risponde, e salva nello storico (max 5 coppie).
     """
     client_id = get_client_id_by_telegram_chat_id(chat_id)
     if not client_id:
-        _tg_post("sendMessage", {"chat_id": chat_id, "text": "⚠️ Non sei associato a nessun tenant Polpo AI."})
+        await _tg_post("sendMessage", {"chat_id": chat_id, "text": "⚠️ Non sei associato a nessun tenant Polpo AI."})
         return
 
-    hist = _conversations.setdefault(chat_id, [])
-    hist.append({"role": "user", "content": text})
+    # Recupera lo storico dal DB (ultimi 10 messaggi)
+    hist = db.get_chat_history(chat_id, limit=10)
+    
+    # Aggiunge il messaggio corrente (non ancora salvato)
+    current_msg = {"role": "user", "content": text}
+    # Salva subito il messaggio dell'utente su DB
+    db.save_chat_message(client_id, chat_id, "user", text)
+    
+    hist.append(current_msg)
 
     anthropic_client = Anthropic()
     logger.info("conversazione | chat_id=%s domanda: %s", chat_id, text[:50])
 
     # Manda indicatore "sto scrivendo..."
-    _tg_post("sendChatAction", {"chat_id": chat_id, "action": "typing"})
+    await _tg_post("sendChatAction", {"chat_id": chat_id, "action": "typing"})
 
     try:
         # Loop: Claude può chiamare tool => eseguiamo => reinviamo => risposta finale
@@ -318,6 +316,12 @@ def _process_conversational_query(chat_id: str, text: str) -> None:
             tools=query_tools.TOOLS,
         )
 
+        # Salvataggio risposta iniziale (o blocco tool) su DB
+        # If Claude's first response is a tool_use, content will be a list of ToolUseBlock.
+        # If it's a text response, content will be a list of TextBlock.
+        # We save the raw content for now, and extract text later if it's a final text response.
+        db.save_chat_message(client_id, chat_id, "assistant", response.content)
+
         # Se Claude usa un tool
         while response.stop_reason == "tool_use":
             tool_use = next(b for b in response.content if b.type == "tool_use")
@@ -328,7 +332,7 @@ def _process_conversational_query(chat_id: str, text: str) -> None:
                 draft_id = tool_use.input.get("draft_id")
                 draft = get_draft_by_id(draft_id)
                 if draft:
-                    _tg_post("sendMessage", {
+                    await _tg_post("sendMessage", {
                         "chat_id": chat_id,
                         "text": _format_message(draft),
                         "parse_mode": "Markdown",
@@ -341,7 +345,7 @@ def _process_conversational_query(chat_id: str, text: str) -> None:
             elif tool_use.name == "report_unsupported_feature":
                 # Invio email notifica admin con history
                 user_req = tool_use.input.get("user_message", "")
-                notify_missing_feature(client_id, chat_id, user_req, hist[:-1]) # Escludiamo l'ultimo tool call block
+                notify_missing_feature(client_id, chat_id, user_req) # Usa history da DB se omessa
                 tool_result = "Il developer è stato notificato correttamente via email."
 
             else:
@@ -355,6 +359,11 @@ def _process_conversational_query(chat_id: str, text: str) -> None:
                 "content": [{"type": "tool_result", "tool_use_id": tool_use.id, "content": tool_result}]
             })
 
+            # Salvataggio dello step tool nel DB 
+            # (opzionale, ma consigliato per coerenza storica se Claude deve ricordarsi dei tool eseguiti)
+            db.save_chat_message(client_id, chat_id, "assistant", response.content)
+            db.save_chat_message(client_id, chat_id, "user", [{"type": "tool_result", "tool_use_id": tool_use.id, "content": tool_result}])
+
             # Reinvocazione per fargli leggere il dato ed elaborare risposta
             response = anthropic_client.messages.create(
                 model=TELEGRAM_ASSISTANT_MODEL,
@@ -364,19 +373,16 @@ def _process_conversational_query(chat_id: str, text: str) -> None:
                 tools=query_tools.TOOLS,
             )
 
+        # Salvataggio risposta finale testuale su DB
         final_text = next((block.text for block in response.content if getattr(block, 'text', None)), "Nessuna risposta.")
-        hist.append({"role": "assistant", "content": final_text})
+        db.save_chat_message(client_id, chat_id, "assistant", final_text)
 
-        # Manteniamo solo ultime 5 coppie per limitare i token
-        if len(hist) > 10:
-            _conversations[chat_id] = hist[-10:]
-
-        _tg_post("sendMessage", {"chat_id": chat_id, "text": final_text})
+        await _tg_post("sendMessage", {"chat_id": chat_id, "text": final_text})
 
     except Exception as e:
         logger.error("conversazione | chat_id=%s errore Claude: %s", chat_id, e)
-        hist.pop()  # Rimuovi l'ultima domanda fallita
-        _tg_post("sendMessage", {"chat_id": chat_id, "text": "Scusa, c'è stato un problema nel recuperare i dati."})
+        # hist.pop()  # Non serve più pop se non è in memoria
+        await _tg_post("sendMessage", {"chat_id": chat_id, "text": "Scusa, c'è stato un problema nel recuperare i dati."})
 
 
 # ─────────────────────────────────────────────

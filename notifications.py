@@ -4,12 +4,12 @@ import logging
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timezone
+import database as db
 
-logger = logging.getLogger("polpo.notifications")
-
-def notify_missing_feature(client_id: str, chat_id: str, message: str, conversation_history: list):
+def notify_missing_feature(client_id: str, chat_id: str, message: str, conversation_history: list = None):
     """
     Invia un'email all'admin segnalando una funzione richiesta ma non disponibile.
+    Usa la history dal DB se non passata.
     """
     smtp_server = os.getenv("SMTP_SERVER", "smtp.gmail.com")
     smtp_port = int(os.getenv("SMTP_PORT", "587"))
@@ -22,6 +22,9 @@ def notify_missing_feature(client_id: str, chat_id: str, message: str, conversat
         return
 
     # Formattazione history
+    if not conversation_history:
+        conversation_history = db.get_chat_history(chat_id, limit=15)
+
     history_str = ""
     if conversation_history:
         for msg in conversation_history:

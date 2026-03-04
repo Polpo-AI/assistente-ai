@@ -104,7 +104,7 @@ PRIORITA_DEFAULT = {
     "pagamento":     2,
     "spam":          1,
     "cortesia":      0,
-    "altro":         1,
+    "altro":         2,
 }
 
 GIORNI = ["Lunedi", "Martedi", "Mercoledi", "Giovedi", "Venerdi", "Sabato", "Domenica"]
@@ -160,7 +160,7 @@ def suggerisci_config_settore(settore):
 # Suggerimento keyword per intent via LLM
 # ─────────────────────────────────────────────
 
-def suggerisci_keywords_per_intent(nome_azienda, settore, intent):
+def suggerisci_keywords_per_intent(nome_azienda, settore, intent, tutti_intenti=[]):
     """
     Genera keyword rappresentative per un dato intent tramite LLM.
     Usate come trigger per il classifier (Livello 2 - regole).
@@ -188,11 +188,13 @@ def suggerisci_keywords_per_intent(nome_azienda, settore, intent):
                 "Rispondi SOLO con un array JSON di stringhe. "
                 "Nessun testo fuori dal JSON."
             )
+            altri = [i for i in tutti_intenti if i != intent]
             user_prompt = (
                 f"Genera 8-10 keyword o frasi brevi che identificano email di tipo '{intent}' "
-                f"per '{nome_azienda}', un'azienda nel settore '{settore}'. "
-                f"Sono usate come trigger per classificare automaticamente le email in arrivo. "
-                f"Devono essere specifiche per il settore e per questo tipo di email. "
+                f"per '{nome_azienda}', un'azienda nel settore '{settore}'.\n"
+                f"IMPORTANTE: Le keyword devono essere UNICHE per questo intent. "
+                f"Evita parole che potrebbero essere confuse con gli altri intenti della lista: {altri}.\n"
+                f"Devono essere specifiche per il settore e per questo tipo di email.\n"
                 f"Formato: [\"keyword 1\", \"keyword 2\", ...]"
             )
 
@@ -222,7 +224,7 @@ def suggerisci_tutte_le_keywords(nome_azienda, settore, intenti):
     risultati = {}
     for intent in intenti:
         print(f"  Genero keyword per '{intent}'...", end=" ", flush=True)
-        kw = suggerisci_keywords_per_intent(nome_azienda, settore, intent)
+        kw = suggerisci_keywords_per_intent(nome_azienda, settore, intent, intenti)
         risultati[intent] = kw
         print(f"OK ({len(kw)} keyword)")
     return risultati
@@ -258,11 +260,17 @@ def raccogli_dati():
     dati["llm_tone"] = chiedi_scelta("Tono delle risposte:", tono_opzioni)
     firma_nome = chiedi("Nome/ragione sociale per la firma", dati["name"])
     dati["signature"] = f"Cordiali saluti,\n{firma_nome}"
-    dati["llm_persona"] = (
+    persona_auto = (
         f"Sei il classificatore email di {dati['name']}, "
         f"un'azienda nel settore {dati['sector']}. "
         f"Analizza le email in arrivo e classificale con precisione."
     )
+    print("\n  [ PERSONA IA GENERATA ]")
+    print_wrap(persona_auto)
+    if conferma("Ti va bene questa descrizione o vuoi modificarla?"):
+        dati["llm_persona"] = persona_auto
+    else:
+        dati["llm_persona"] = chiedi("Inserisci la descrizione personalizzata (Persona)", persona_auto)
 
     # ── TELEGRAM ─────────────────────────────
     sezione("3. TELEGRAM")
@@ -271,8 +279,8 @@ def raccogli_dati():
     dati["telegram_chat_id"] = chiedi("Il tuo Chat ID Telegram (opzionale)", "")
 
     # ── EMAIL (IMAP/SMTP) ─────────────────────
-    sezione("4. CONNESSIONE EMAIL (Autonoma)")
-    print("\n  Configura le credenziali per leggere e inviare email senza n8n.")
+    sezione("4. CONNESSIONE EMAIL")
+    print("\n  Configura le credenziali per leggere e inviare email direttamente.")
 
     dati["imap_host"] = chiedi("IMAP Host (es: imap.gmail.com)", "imap.gmail.com")
     dati["imap_port"] = int(chiedi("IMAP Port", "993"))

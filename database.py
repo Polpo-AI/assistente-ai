@@ -278,17 +278,25 @@ def mark_email_no_reply(email_id: str, summary: str = "") -> dict:
     
     email_data = email_res.data[0]
     
-    result = db.table("draft_responses").upsert({
+    # Verifica se esiste già
+    existing = db.table("draft_responses").select("id").eq("email_id", email_id).execute()
+    
+    data = {
         "email_id":    email_id,
         "client_id":   email_data["client_id"],
         "subject":     email_data["subject"],
         "body":        "[Nessuna risposta necessaria - Sistema Polpo AI]",
-        "status":      "sent", # Lo segnamo come 'sent' (o un altro stato finale) per non apparire tra i pending
+        "status":      "sent",
         "final_intent": "cortesia",
         "warning":     summary or "Email automatica o di cortesia."
-    }, on_conflict="email_id").execute()
+    }
     
-    return result.data[0]
+    if existing.data:
+        result = db.table("draft_responses").update(data).eq("id", existing.data[0]["id"]).execute()
+    else:
+        result = db.table("draft_responses").insert(data).execute()
+    
+    return result.data[0] if result.data else {}
 
 
 def mark_draft_sent(draft_id: str) -> dict:
@@ -539,3 +547,41 @@ def add_sender_to_blacklist(client_id: str, sender_email: str) -> bool:
         current_keywords.append(sender_email)
         db.table("clients").update({"custom_spam_keywords": current_keywords}).eq("id", client_id).execute()
     return True
+
+
+# ─────────────────────────────────────────────
+# CHAT HISTORY
+# ─────────────────────────────────────────────
+
+def save_chat_message(client_id: str, chat_id: str, role: str, content: any) -> bool:
+    """Salva un messaggio della chat assistente (Telegram) su DB."""
+    try:
+        db = get_client()
+        db.table("chat_history").insert({
+            "client_id": client_id,
+            "chat_id": str(chat_id),
+            "role": role,
+            "content": content
+        }).execute()
+        return True
+    except Exception as e:
+        logger.error(f"Errore save_chat_message: {e}")
+        return False
+
+def get_chat_history(chat_id: str, limit: int = 10) -> list:
+    """Recupera gli ultimi N messaggi della chat per il conteggio context."""
+    try:
+        db = get_client()
+        res = db.table("chat_history") \
+                .select("role, content") \
+                .eq("chat_id", str(chat_id)) \
+                .order("created_at", desc=True) \
+                .limit(limit) \
+                .execute()
+        
+        # Invertiamo per avere ordine cronologico corretto per Claude
+        history = res.data[::-1]
+        return history
+    except Exception as e:
+        logger.error(f"Errore get_chat_history: {e}")
+        return []

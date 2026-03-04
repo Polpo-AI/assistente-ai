@@ -22,24 +22,18 @@ Polpo AI è un sistema di automazione email multi-tenant progettato per classifi
 5.  **Invio (`email_worker.py`)**: Un watcher in background rileva le bozze approvate e le invia via SMTP utilizzando le credenziali specifiche del cliente.
 
 ## 🛠 Tech Stack
-*   **Backend**: FastAPI (Python)
-*   **Worker**: Asyncio (IMAP/SMTP Polling)
-*   **Database**: Supabase (PostgreSQL)
+*   **Backend**: FastAPI (Python 3.10+)
+*   **Worker**: Asyncio (IMAP/SMTP Polling & Mailing)
+*   **Database**: Supabase (Postgres + Realtime)
 *   **AI**: Anthropic Claude (Haiku per classificazione, Sonnet per draft/ragionamento/tool-calling)
+*   **Search**: DuckDuckGo Search API (per assistente telegram)
 *   **Integrazione**: Telegram Bot API
-*   **Infrastructure**: Multi-tenant (configurazioni e credenziali mail isolate per client_id)
+*   **Infrastruttura**: Architettura Multi-tenant isolata
 
-## 📂 Struttura File Core
-*   `main.py`: Entry point API, router webhook Telegram e rotte dashboard.
-*   `email_worker.py`: Worker asincrono per polling IMAP (lettura) e invio SMTP (invio bozze approvate).
-*   `classifier.py`: Logica di classificazione a cascata.
-*   `responder.py`: Pipeline di generazione bozze e refinement.
-*   `telegram_bot.py`: Logica del bot Telegram (notifiche e conversazione).
-*   `query_tools.py`: Tool di interrogazione DB per l'assistente AI (function calling).
-*   `database.py`: Wrapper per le chiamate a Supabase.
-*   `client_config.py`: Gestione configurazioni dinamiche dei clienti.
-*   `notifications.py`: Gestione notifiche amministrative (es. funzioni mancanti).
-*   `onboard_client.py`: Script CLI per configurare nuovi tenant.
+## 🚀 Roadmap Futura
+*   **Polpo Voice**: Implementazione Speech-to-Text (STT) per elaborare messaggi vocali su Telegram.
+*   **Dashboard KPI**: Piattaforma web (Frontend) per visualizzare metriche di performance, volumi email e statistiche per ogni cliente.
+*   **Webhooks**: Espansione del sistema di notifiche per integrazioni esterne (CRM).
 
 ---
-*Ultimo aggiornamento: 2026-03-03*
+*Ultimo aggiornamento: 2026-03-04*

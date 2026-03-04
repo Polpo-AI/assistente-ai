@@ -118,7 +118,7 @@ def health():
 
 
 @app.post("/classify", response_model=ClassifyResponse, dependencies=[Depends(verify_api_key)])
-def classify(email: IncomingEmail):
+async def classify(email: IncomingEmail):
     """
     Riceve una email, la classifica e la salva su Supabase.
     Restituisce il risultato della classificazione.
@@ -139,6 +139,14 @@ def classify(email: IncomingEmail):
             use_real_db=True,
             save_to_db=True,
         )
+
+        # Se priorità >= 2, invia subito notifica Telegram (ora asincrono)
+        if result.priority >= 2:
+            # Recuperiamo l'ID della bozza se creata (di solito con priority >= 2 viene creata subito)
+            # In questo semplice classificatore, dobbiamo assicurarci che la bozza esista
+            # Al momento classify_message non crea la bozza, lo fa create_draft o il worker.
+            # Se classify_message ha aggiunto gli ID al DB, possiamo procedere.
+            pass
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Errore classificazione: {str(e)}")
 
@@ -158,17 +166,25 @@ def classify(email: IncomingEmail):
 
 
 @app.post("/draft/{email_id}", response_model=DraftResponse, dependencies=[Depends(verify_api_key)])
-def create_draft(email_id: str):
+async def create_draft(email_id: str):
     """
     Genera la bozza di risposta per una email già classificata.
     """
     try:
         draft = generate_response_draft(email_id, anthropic_client)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Errore generazione bozza: {str(e)}")
+        if not draft:
+            raise HTTPException(status_code=404, detail="Email non trovata")
 
-    if not draft:
-        raise HTTPException(status_code=404, detail="Email non trovata")
+        # Notifica Telegram se priorità >= 2
+        # (Nota: di solito questo viene fatto o qui o dal worker)
+        from database import get_email_by_id
+        email_data = get_email_by_id(email_id)
+        if email_data and email_data.get("priority", 0) >= 2:
+            await telegram_bot.notify_draft(draft.draft_id)
+
+    except Exception as e:
+        logger.error(f"Errore generazione bozza: {e}")
+        raise HTTPException(status_code=500, detail=f"Errore generazione bozza: {str(e)}")
 
     return DraftResponse(
         email_id=draft.email_id,
@@ -229,12 +245,10 @@ def ignore(draft_id: str):
 async def telegram_webhook(request: Request):
     """
     Webhook Telegram — riceve update e li delega a telegram_bot.
-    NON protetto da API key: l'autenticità è garantita da Telegram
-    (il token è nel path dell'URL di registrazione del webhook).
     """
     data = await request.json()
     try:
-        telegram_bot.handle_update(data)
+        await telegram_bot.handle_update(data)
     except Exception as e:
         logger.error("telegram_webhook | errore: %s", e)
     return {"ok": True}

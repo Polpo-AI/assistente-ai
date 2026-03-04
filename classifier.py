@@ -57,7 +57,7 @@ PRIORITY_MAP = {
     "pagamento":    2,
     "informazione": 1,
     "info":         1,
-    "spam":         1,
+    "spam":         0,   # spam, marketing, phishing → non rispondere
     "altro":        1,
     "cortesia":     0,   # ringraziamenti, conferme, no-reply → non rispondere
 }
@@ -207,17 +207,30 @@ def _build_llm_prompt(config: ClientConfig) -> str:
 Analizza il messaggio email e rispondi SOLO con un JSON valido:
 {{
   "contact_type": "cliente" | "fornitore" | "spam" | "personale" | "sconosciuto",
-  "intent": {config.all_intents_str()},
+  "intent": {config.all_intents_str()} | "spam",
   "priority": 0 | 1 | 2 | 3,
   "confidence": 0.0-1.0,
   "summary": "max 100 caratteri",
   "estimated_value": null oppure float se preventivo con valore stimabile
 }}
-Priorità: 0=non rispondere (cortesia/automatico), 1=bassa, 2=media, 3=urgente.
-Usa priority 0 per: ringraziamenti, conferme di lettura, messaggi senza richiesta, mittenti automatici.
+
+REGOLE DI PRIORITA':
+- 0 (ZERO ASSOLUTO): usa TASSATIVAMENTE per spam, pubblicità non richiesta, phishing, email automatiche, ringraziamenti e SOPRATTUTTO per richieste fuori settore (Out of Scope, es. richieste di servizi web per un'azienda di trasporti). Se priorità è 0 per posta indesiderata/OOS imposta "intent": "spam".
+- 1: bassa (info generiche non urgenti pertinenti al settore)
+- 2: media (preventivi, appuntamenti, pagamenti reali pertinenti)
+- 3: urgente (reclami gravi, urgenze operative in target)
+
 Non aggiungere testo fuori dal JSON."""
 
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import anthropic
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type((anthropic.APIError, anthropic.APIConnectionError, anthropic.RateLimitError)),
+    before_sleep=lambda retry_state: logger.warning(f"Retrying LLM classification... Attempt {retry_state.attempt_number}")
+)
 def classify_with_llm(
     msg: InboundMessage,
     config: ClientConfig,
