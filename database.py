@@ -257,6 +257,33 @@ def ignore_draft(draft_id: str) -> dict:
     return result.data[0]
 
 
+def mark_email_no_reply(email_id: str, summary: str = "") -> dict:
+    """
+    Crea una voce in draft_responses con stato 'no_reply_needed' per email Priority 0.
+    In questo modo tracciamo che l'email è stata gestita anche senza bozza.
+    """
+    db = get_client()
+    
+    # Recuperiamo il client_id dall'email
+    email_res = db.table("emails").select("client_id, subject").eq("id", email_id).execute()
+    if not email_res.data:
+        return {}
+    
+    email_data = email_res.data[0]
+    
+    result = db.table("draft_responses").upsert({
+        "email_id":    email_id,
+        "client_id":   email_data["client_id"],
+        "subject":     email_data["subject"],
+        "body":        "[Nessuna risposta necessaria - Sistema Polpo AI]",
+        "status":      "sent", # Lo segnamo come 'sent' (o un altro stato finale) per non apparire tra i pending
+        "final_intent": "cortesia",
+        "warning":     summary or "Email automatica o di cortesia."
+    }, on_conflict="email_id").execute()
+    
+    return result.data[0]
+
+
 def mark_draft_sent(draft_id: str) -> dict:
     """Marca una bozza come inviata."""
     db = get_client()

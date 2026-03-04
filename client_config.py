@@ -29,6 +29,7 @@ class ClientConfig:
     signature:            str
     intent_list:          list
     priority_map:         dict    # {"reclamo": 3, "preventivo": 2, ...}
+    intent_keywords:      dict    # {"preventivo": ["keyword1", ...]}
     custom_spam_keywords: list
     intent_instructions:  dict
     contacts:             dict
@@ -174,6 +175,7 @@ def get_client_config(client_id: str, force_refresh: bool = False) -> Optional[C
         signature=row.get("signature", "Cordiali saluti"),
         intent_list=parse_json_field(row.get("intent_list"), []),
         priority_map=parse_json_field(row.get("priority_map"), {}),
+        intent_keywords=parse_json_field(row.get("intent_keywords"), {}),
         custom_spam_keywords=parse_json_field(row.get("custom_spam_keywords"), []),
         intent_instructions=parse_json_field(row.get("intent_instructions"), {}),
         contacts=parse_json_field(row.get("contacts"), {}),

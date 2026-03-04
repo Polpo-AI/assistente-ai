@@ -1,4 +1,9 @@
 """
+[AI REFERENCE] Per una visione d'insieme dell'architettura e del flusso logico, 
+leggere il file: PROJECT_SUMMARY.md
+"""
+
+"""
 telegram_bot.py — Bot Telegram per approvazione bozze Polpo AI
 
 Flusso:
@@ -35,6 +40,7 @@ from database import (
 from responder import refine_draft
 import query_tools
 from notifications import notify_missing_feature
+from models_config import TELEGRAM_ASSISTANT_MODEL
 
 load_dotenv()
 
@@ -265,7 +271,7 @@ def _process_conversational_query(chat_id: str, text: str) -> None:
     try:
         # Loop: Claude può chiamare tool => eseguiamo => reinviamo => risposta finale
         response = anthropic_client.messages.create(
-            model="claude-3-5-haiku-20241022",
+            model=TELEGRAM_ASSISTANT_MODEL,
             max_tokens=1000,
             timeout=40.0,
             system=(
@@ -321,7 +327,7 @@ def _process_conversational_query(chat_id: str, text: str) -> None:
 
             # Reinvocazione per fargli leggere il dato ed elaborare risposta
             response = anthropic_client.messages.create(
-                model="claude-3-5-haiku-20241022",
+                model=TELEGRAM_ASSISTANT_MODEL,
                 max_tokens=1000,
                 timeout=40.0,
                 messages=hist,

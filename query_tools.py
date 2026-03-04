@@ -12,6 +12,7 @@ Modelli:
 import logging
 from typing import Optional
 from anthropic import Anthropic
+from models_config import SUMMARIZER_MODEL
 
 import database as db
 from responder import generate_response_draft
@@ -364,7 +365,7 @@ def _summarize_with_sonnet(client_id: str, date_from: str, date_to: str, client:
     )
 
     response = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model=SUMMARIZER_MODEL,
         max_tokens=600,
         timeout=60.0,
         system=(

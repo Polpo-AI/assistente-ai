@@ -1,4 +1,9 @@
 """
+[AI REFERENCE] Per una visione d'insieme dell'architettura e del flusso logico, 
+leggere il file: PROJECT_SUMMARY.md
+"""
+
+"""
 Email Classifier - Cascade Pipeline (v3 Multi-Tenant)
 
 Livello 1: Lookup DB (mittente noto per questo cliente)
@@ -54,7 +59,19 @@ PRIORITY_MAP = {
     "info":         1,
     "spam":         1,
     "altro":        1,
+    "cortesia":     0,   # ringraziamenti, conferme, no-reply → non rispondere
 }
+
+# Pattern mittenti automatici/noreply — controllati prima di tutto
+NOREPLY_PATTERNS = [
+    r"no.?reply", r"do.?not.?reply", r"noreply",
+    r"mailer.daemon", r"postmaster",
+    r"notifications?@", r"alerts?@",
+    r"auto.?reply", r"automated?@",
+]
+
+# Pattern per messaggi di cortesia non azionabili
+CORTESIA_PATTERN = r"\b(grazie\s*mille|grazie|perfetto|ricevuto|ok\s+grazie|ottimo|capito|va\s+bene|thank\s+you|thanks)\b"
 
 
 # ─────────────────────────────────────────────
@@ -73,7 +90,7 @@ class InboundMessage:
 class ClassificationResult:
     contact_type:    str
     intent:          str
-    priority:        int            # 1=bassa, 2=media, 3=urgente
+    priority:        int            # 0=non rispondere, 1=bassa, 2=media, 3=urgente
     confidence:      float
     classified_by:   str            # "db_lookup"|"rules"|"llm"|"llm_fallback"
     summary:         str
@@ -109,6 +126,30 @@ def apply_rules(msg: InboundMessage, config: ClientConfig) -> Optional[Classific
     Usa la configurazione del cliente (spam keywords extra, intent list).
     """
     text = (msg.subject + " " + msg.body).lower()
+    sender = msg.sender_email.lower()
+
+    # Priorità 0 — Mittenti automatici/noreply: non rispondere
+    if any(re.search(p, sender) for p in NOREPLY_PATTERNS):
+        return ClassificationResult(
+            contact_type="automatico",
+            intent="cortesia",
+            priority=0,
+            confidence=0.99,
+            classified_by="rules",
+            summary="Mittente automatico o noreply — nessuna risposta necessaria."
+        )
+
+    # Priorità 0 — Messaggi di cortesia non azionabili
+    body_short = msg.body.strip()
+    if len(body_short) < 120 and re.search(CORTESIA_PATTERN, text, re.IGNORECASE):
+        return ClassificationResult(
+            contact_type="cliente",
+            intent="cortesia",
+            priority=0,
+            confidence=0.90,
+            classified_by="rules",
+            summary="Messaggio di cortesia non azionabile — nessuna risposta necessaria."
+        )
 
     # Spam: keywords base + quelle custom del cliente
     all_spam_kw = BASE_SPAM_KEYWORDS + config.custom_spam_keywords
@@ -122,7 +163,23 @@ def apply_rules(msg: InboundMessage, config: ClientConfig) -> Optional[Classific
             summary="Messaggio spam rilevato da keyword matching."
         )
 
-    # Intent detection con pattern base
+    # Intent detection: 1. Custom keywords del cliente (Priorità)
+    if config.intent_keywords:
+        for intent, keywords in config.intent_keywords.items():
+            if intent not in config.intent_list:
+                continue
+            for kw in keywords:
+                if kw.lower() in text:
+                    return ClassificationResult(
+                        contact_type="sconosciuto",
+                        intent=intent,
+                        priority=config.priority_map.get(intent, PRIORITY_MAP.get(intent, 1)),
+                        confidence=0.90,  # Alta confidence per match esatto impostato dal cliente
+                        classified_by="rules",
+                        summary=f"Intent rilevato via keyword personalizzata '{kw}': {intent}."
+                    )
+
+    # Intent detection: 2. Pattern base (Fallback)
     for intent, pattern in BASE_INTENT_PATTERNS.items():
         # Salta intent non presenti nella lista del cliente
         if intent not in config.intent_list:
@@ -134,7 +191,7 @@ def apply_rules(msg: InboundMessage, config: ClientConfig) -> Optional[Classific
                 priority=config.priority_map.get(intent, PRIORITY_MAP.get(intent, 1)),
                 confidence=0.75,
                 classified_by="rules",
-                summary=f"Intent rilevato: {intent}. Mittente non in rubrica."
+                summary=f"Intent rilevato via pattern base: {intent}. Mittente non in rubrica."
             )
 
     return None  # → passa al LLM
@@ -151,12 +208,13 @@ Analizza il messaggio email e rispondi SOLO con un JSON valido:
 {{
   "contact_type": "cliente" | "fornitore" | "spam" | "personale" | "sconosciuto",
   "intent": {config.all_intents_str()},
-  "priority": 1 | 2 | 3,
+  "priority": 0 | 1 | 2 | 3,
   "confidence": 0.0-1.0,
   "summary": "max 100 caratteri",
   "estimated_value": null oppure float se preventivo con valore stimabile
 }}
-Priorità: 1=bassa, 2=media, 3=urgente.
+Priorità: 0=non rispondere (cortesia/automatico), 1=bassa, 2=media, 3=urgente.
+Usa priority 0 per: ringraziamenti, conferme di lettura, messaggi senza richiesta, mittenti automatici.
 Non aggiungere testo fuori dal JSON."""
 
 
@@ -174,8 +232,9 @@ Allegati: {', '.join(msg.attachments) if msg.attachments else 'nessuno'}
 ---
 {msg.body[:1500]}
 """
+    from models_config import CLASSIFIER_MODEL
     response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
+        model=CLASSIFIER_MODEL,
         max_tokens=300,
         timeout=30.0,
         system=_build_llm_prompt(config),
@@ -230,6 +289,7 @@ def classify_message(
     msg: InboundMessage,
     client_id: str,
     llm_client: Anthropic = None,
+    config: Optional[ClientConfig] = None,
     llm_confidence_threshold: float = 0.70,
     save_to_db: bool = True,
     use_real_db: bool = True,
@@ -245,7 +305,8 @@ def classify_message(
     """
 
     # ── Config cliente ────────────────────────
-    config = get_client_config(client_id) if use_real_db else _mock_config(client_id)
+    if not config:
+        config = get_client_config(client_id) if use_real_db else _mock_config(client_id)
     if not config:
         raise ValueError(f"Cliente {client_id} non trovato o non attivo.")
 
@@ -339,13 +400,18 @@ def _mock_config(client_id: str) -> ClientConfig:
         client_id=client_id,
         name="Officina Test",
         sector="automotive",
+        language="Italiano",
         llm_persona="Sei il classificatore email di un'officina italiana.",
         llm_tone="professionale e cordiale",
         signature="Cordiali saluti,\nOfficina Test",
         intent_list=["preventivo","appuntamento","informazione","reclamo","pagamento","spam","altro"],
         priority_map={},
+        intent_keywords={},
         custom_spam_keywords=[],
         intent_instructions={},
+        contacts={},
+        orari={},
+        faq=[],
     )
 
 

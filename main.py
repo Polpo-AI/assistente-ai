@@ -1,14 +1,19 @@
 """
+[AI REFERENCE] Per una visione d'insieme dell'architettura e del flusso logico, 
+leggere il file: PROJECT_SUMMARY.md
+"""
+
+"""
 main.py — API FastAPI per Polpo AI Email Bot
 
-Espone le rotte che n8n chiama per processare le email.
+Espone le rotte per processare le email dalla pipeline Python o dashboard.
 
 Rotte:
-  POST /classify          ← n8n invia email in arrivo
-  POST /draft/{email_id}  ← n8n chiede bozza per una email
-  GET  /pending           ← dashboard legge email in attesa
-  POST /approve/{draft_id}← dashboard approva una bozza
-  GET  /health            ← n8n verifica che il server sia up
+  POST /classify          ← Invia email in arrivo per classificazione
+  POST /draft/{email_id}  ← Chiede generazione bozza per una email
+  GET  /pending           ← Dashboard legge email in attesa
+  POST /approve/{draft_id}← Dashboard approva una bozza
+  GET  /health            ← Verifica che il server sia up
 
 Dipendenze:
     pip install fastapi uvicorn anthropic supabase python-dotenv
@@ -51,14 +56,14 @@ app = FastAPI(
 anthropic_client = Anthropic()
 
 # ─────────────────────────────────────────────
-# Sicurezza — API Key semplice per n8n
+# Sicurezza — API Key semplice per chiamate esterne
 # In produzione usa OAuth o JWT
 # ─────────────────────────────────────────────
 
 API_SECRET = os.environ.get("POLPO_API_SECRET", "changeme")
 
 def verify_api_key(x_api_key: str = Header(...)) -> None:
-    """Dipendenza FastAPI — protezione semplice per n8n.
+    """Dipendenza FastAPI — protezione semplice per chiamate API.
     Usare come: Depends(verify_api_key) nelle rotte.
     In produzione sostituire con OAuth o JWT.
     """
@@ -90,8 +95,6 @@ class ClassifyResponse(BaseModel):
     classified_by:  str
     summary:        str
     estimated_value: Optional[float] = None
-    # Indica al workflow n8n cosa fare dopo
-    next_action:    str  # "send_auto" | "notify_whatsapp" | "alert_urgent"
 
 class DraftResponse(BaseModel):
     email_id:          str
@@ -110,20 +113,15 @@ class DraftResponse(BaseModel):
 
 @app.get("/health")
 def health():
-    """n8n chiama questa rotta per verificare che il server sia up."""
+    """Verifica che il server sia up."""
     return {"status": "ok", "service": "Polpo AI Email Bot"}
 
 
 @app.post("/classify", response_model=ClassifyResponse, dependencies=[Depends(verify_api_key)])
 def classify(email: IncomingEmail):
     """
-    Riceve una email da n8n, la classifica e la salva su Supabase.
-    Restituisce il risultato + next_action per guidare il workflow n8n.
-
-    next_action:
-      "send_auto"       → Priority BASSA  → n8n chiama /draft e invia
-      "notify_whatsapp" → Priority MEDIA  → n8n manda WhatsApp con bottoni
-      "alert_urgent"    → Priority URGENTE→ n8n manda alert WhatsApp al titolare
+    Riceve una email, la classifica e la salva su Supabase.
+    Restituisce il risultato della classificazione.
     """
     msg = InboundMessage(
         sender_email=email.sender_email,
@@ -147,23 +145,6 @@ def classify(email: IncomingEmail):
     if not result.db_ids:
         raise HTTPException(status_code=500, detail="Errore salvataggio DB")
 
-    # Mappa priorità → azione n8n
-    next_action_map = {
-        1: "send_auto",
-        2: "notify_whatsapp",
-        3: "alert_urgent",
-    }
-
-    email_id = result.db_ids["email_id"]
-    draft_id  = result.db_ids.get("draft_id")  # potrebbe non esistere ancora (generata dopo)
-
-    # Notifica Telegram per email di priorità media o urgente
-    if result.priority >= 2 and draft_id:
-        try:
-            telegram_bot.notify_draft(draft_id)
-        except Exception as e:
-            logger.warning("classify | notifica Telegram fallita: %s", e)
-
     return ClassifyResponse(
         email_id=email_id,
         contact_type=result.contact_type,
@@ -173,7 +154,6 @@ def classify(email: IncomingEmail):
         classified_by=result.classified_by,
         summary=result.summary,
         estimated_value=result.estimated_value,
-        next_action=next_action_map.get(result.priority, "notify_whatsapp"),
     )
 
 
@@ -181,7 +161,6 @@ def classify(email: IncomingEmail):
 def create_draft(email_id: str):
     """
     Genera la bozza di risposta per una email già classificata.
-    n8n chiama questa rotta dopo /classify.
     """
     try:
         draft = generate_response_draft(email_id, anthropic_client)
@@ -223,9 +202,8 @@ def pending(
 @app.post("/approve/{draft_id}", dependencies=[Depends(verify_api_key)])
 def approve(draft_id: str, body: ApproveRequest):
     """
-    Approva una bozza dalla dashboard o da WhatsApp.
+    Approva una bozza dalla dashboard o da Telegram.
     Cambia lo status da 'pending' ad 'approved'.
-    n8n intercetta questo cambio e procede con l'invio.
     """
     try:
         approve_draft(draft_id, body.approved_by)

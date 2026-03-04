@@ -1,4 +1,9 @@
 """
+[AI REFERENCE] Per una visione d'insieme dell'architettura e del flusso logico, 
+leggere il file: PROJECT_SUMMARY.md
+"""
+
+"""
 responder.py — Modulo Responder (v3 Multi-Tenant)
 
 Genera bozze di risposta personalizzate per settore.
@@ -30,9 +35,10 @@ logger = logging.getLogger("polpo.responder")
 # Configurazione
 # ─────────────────────────────────────────────
 
-RECLASSIFY_THRESHOLD = 0.5
-RECLASSIFY_MODEL     = "claude-sonnet-4-20250514"
-RESPONDER_MODEL      = "claude-sonnet-4-20250514"
+from models_config import RECLASSIFY_MODEL, RESPONDER_MODEL
+
+RECLASSIFY_THRESHOLD = 0.7  # Se la confidence è più bassa, usa Sonnet per riclassificare
+
 # ─────────────────────────────────────────────
 # Dataclasses
 # ─────────────────────────────────────────────
