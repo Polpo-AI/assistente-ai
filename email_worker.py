@@ -139,16 +139,6 @@ async def fetch_new_emails_imap(client: dict) -> list[dict]:
     """
     client_id = client["id"]
     last_uid_global = int(client.get("imap_last_uid") or 0)
-    
-    # Stato locale per gestire UID per cartella (INBOX vs Spam hanno sequenze diverse)
-    # File: /tmp/polpo_uid_state.json
-    import json
-    state_file = "/tmp/polpo_uid_state.json"
-    state = {}
-    if os.path.exists(state_file):
-        try:
-            with open(state_file, "r") as f: state = json.load(f)
-        except: pass
 
     imap = aioimaplib.IMAP4_SSL(
         host=client["imap_host"],
@@ -159,7 +149,9 @@ async def fetch_new_emails_imap(client: dict) -> list[dict]:
     try:
         logger.info("worker.imap | [%s] Connessione a %s:%s...", client["name"], client["imap_host"], client.get("imap_port", 993))
         await imap.wait_hello_from_server()
-        await imap.login(client["imap_user"], client["imap_password"])
+        # Gmail app passwords are stored with spaces (e.g. "xxxx xxxx xxxx xxxx") — strip them
+        imap_password = (client["imap_password"] or "").replace(" ", "")
+        await imap.login(client["imap_user"], imap_password)
         logger.info("worker.imap | [%s] Login effettuato", client["name"])
         
         # Lista cartelle da controllare
@@ -172,68 +164,53 @@ async def fetch_new_emails_imap(client: dict) -> list[dict]:
         emails_found = []
 
         for folder in folders:
-            # Recupera ultimo UID visto per QUESTA cartella
-            folder_key = f"{client_id}_{folder}"
-            last_uid = state.get(folder_key, last_uid_global if folder == "INBOX" else 0)
+            # Per INBOX usa imap_last_uid dal DB; per Spam parte sempre da 0
+            last_uid = last_uid_global if folder == "INBOX" else 0
 
             logger.info("worker.imap | [%s] Seleziono %s (last_uid seen: %d)...", client["name"], folder, last_uid)
             select_res = await imap.select(folder)
             if select_res[0] != 'OK':
                 continue
 
-            # Analisi ultime 50 mail
-            _, data = await imap.search("ALL")
-            seq_list_all = [s for s in data[0].decode().split() if s.strip()]
-            seq_list = seq_list_all[-50:]
-            
-            logger.info("worker.imap | [%s] Analisi ultime %d email in %s", client["name"], len(seq_list), folder)
+            # Cerca direttamente solo i UID > last_uid (evita di scaricare email già processate)
+            # UID SEARCH UID N:* ritorna solo i messaggi con UID >= N, mai quelli vecchi
+            search_uid_from = last_uid + 1
+            _, data = await imap.uid("search", f"UID {search_uid_from}:*")
+            uid_list = [u for u in data[0].decode().split() if u.strip()]
 
-            for seq_str in seq_list:
-                # Recuperiamo UID e corpo
-                _, msg_data = await imap.fetch(seq_str, "(UID RFC822)")
+            if not uid_list:
+                logger.info("worker.imap | [%s] Nessuna nuova email in %s (last_uid=%d)", client["name"], folder, last_uid)
+                continue
+
+            logger.info("worker.imap | [%s] %d nuove email in %s (UID > %d)", client["name"], len(uid_list), folder, last_uid)
+
+            for uid_str in uid_list:
+                uid = int(uid_str)
+
+                # Scarica il corpo via UID FETCH (non sequence number)
+                _, msg_data = await imap.uid("fetch", uid_str, "(RFC822)")
                 if not msg_data:
+                    logger.warning("worker.imap | [%s] Nessun dato per UID %d", client["name"], uid)
                     continue
-                
-                uid = None
+
                 raw_bytes = None
-                
-                for i, part in enumerate(msg_data):
-                    # Il corpo RFC822 può essere bytes o bytearray (come visto nei log di debug)
-                    if isinstance(part, (bytes, bytearray)):
-                        p_bytes = bytes(part)
-                        
-                        # Se il segmento contiene i metadati (UID, RFC822, etc), estraiamo l'UID
-                        if b"UID " in p_bytes:
-                            import re
-                            m = re.search(r"UID (\d+)", p_bytes.decode(errors="ignore"))
-                            if m: uid = int(m.group(1))
-                        
-                        # Il corpo RFC822 è il segmento di bytes che NON è la riga di comando IMAP.
-                        # Identifichiamo il corpo come il segmento più grande (> 100 bytes).
-                        if len(p_bytes) > 100:
-                            if not raw_bytes or len(p_bytes) > len(raw_bytes):
-                                raw_bytes = p_bytes
-                        elif not raw_bytes and len(p_bytes) > 30 and b"UID" not in p_bytes:
-                            # Fallback per email estremamente corte, evitando i piccoli meta-frammenti
-                            raw_bytes = p_bytes
+                for part in msg_data:
+                    if isinstance(part, (bytes, bytearray)) and len(part) > 100:
+                        raw_bytes = bytes(part)
+                        break
                     elif isinstance(part, tuple):
-                        # Spesso aioimaplib ritorna tuple (header, body_bytes)
                         for sub in part:
                             if isinstance(sub, (bytes, bytearray)) and len(sub) > 100:
                                 raw_bytes = bytes(sub)
                                 break
+                        if raw_bytes:
+                            break
 
-                if uid:
-                    logger.info("worker.imap | [%s] Seq %s -> UID %d", client["name"], seq_str, uid)
-
-                if not uid or uid <= last_uid:
-                    continue
-                
-                logger.info("worker.imap | [%s] Trovata NUOVA email! (UID: %d > %d)", client["name"], uid, last_uid)
+                logger.info("worker.imap | [%s] Trovata NUOVA email (UID: %d)", client["name"], uid)
                 if not raw_bytes:
-                    logger.warning("worker.imap | [%s] Nessun corpo RFC822 trovato per UID: %d", client["name"], uid)
+                    logger.warning("worker.imap | [%s] Nessun corpo RFC822 per UID %d", client["name"], uid)
                     continue
-                
+
                 logger.info("worker.imap | [%s] Parsing email UID: %d", client["name"], uid)
 
                 msg = email_lib.message_from_bytes(raw_bytes, policy=email_lib.policy.default)
@@ -282,15 +259,6 @@ async def fetch_new_emails_imap(client: dict) -> list[dict]:
                     "message_id":   message_id,
                     "folder":       folder
                 })
-
-            # Aggiorna lo stato locale per questa cartella se abbiamo visto UID nuovi
-            if seq_list:
-                # Recuperiamo l'ultimo UID reale del batch per salvare lo stato
-                # (L'ultimo della lista è solitamente il più alto)
-                state[folder_key] = max([e["uid"] for e in emails_found if e["folder"] == folder] + [last_uid])
-                try:
-                    with open(state_file, "w") as f: json.dump(state, f)
-                except: pass
 
         await imap.logout()
         # Ordina per UID totale (opzionale)
@@ -430,7 +398,7 @@ async def send_email_smtp(draft: dict) -> None:
             hostname=client_smtp["smtp_host"],
             port=int(client_smtp.get("smtp_port") or 587),
             username=client_smtp["smtp_user"],
-            password=client_smtp["smtp_password"],
+            password=(client_smtp["smtp_password"] or "").replace(" ", ""),
             start_tls=True,
             timeout=30,
         )
