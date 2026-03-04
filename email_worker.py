@@ -155,11 +155,8 @@ async def fetch_new_emails_imap(client: dict) -> list[dict]:
         logger.info("worker.imap | [%s] Login effettuato", client["name"])
         
         # Lista cartelle da controllare
+        # Solo INBOX per ora — la cartella Spam di Gmail richiede gestione separata
         folders = ["INBOX"]
-        if "gmail.com" in client["imap_host"].lower():
-            folders.append("\"[Gmail]/Spam\"")
-        elif "zoho" in client["imap_host"].lower():
-            folders.append("Spam")
         
         emails_found = []
 
