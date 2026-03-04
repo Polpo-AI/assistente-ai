@@ -169,38 +169,48 @@ def _handle_callback(cq: dict) -> None:
 
     if not draft:
         _edit_message(chat_id, message_id, "⚠️ Bozza non trovata.")
+        _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": "Errore: Bozza non trovata", "show_alert": True})
         return
 
     # Gestione conflitti: bozza già gestita da altro canale
     if draft.get("status") != "pending":
-        _edit_message(chat_id, message_id,
-                      "⚠️ Questa email è già stata gestita.")
+        _edit_message(chat_id, message_id, "⚠️ Questa email è già stata gestita.")
+        _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": "Già gestita!", "show_alert": False})
         logger.info("callback | draft_id=%s già in stato '%s' — conflitto ignorato",
-                    draft_id[:8], draft.get("status"))
+                    draft_id[:8], draft.get("status"])
         return
 
     if action == "invia":
-        approve_draft(draft_id, approved_by="telegram")
-        _edit_message(chat_id, message_id, "✅ Bozza inviata.")
-        logger.info("callback | draft_id=%s approvata da Telegram", draft_id[:8])
+        try:
+            approve_draft(draft_id, approved_by="telegram")
+            _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": "🚀 Invio in corso...", "show_alert": False})
+            _edit_message(chat_id, message_id, "✅ Bozza inviata con successo.")
+            logger.info("callback | draft_id=%s approvata da Telegram", draft_id[:8])
+        except Exception as e:
+            _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": "❌ Errore durante l'invio", "show_alert": True})
+            logger.error("callback | errore invia: %s", e)
 
     elif action == "ignora":
-        ignore_draft(draft_id)
-        _edit_message(chat_id, message_id, "🗑 Email ignorata.")
-        logger.info("callback | draft_id=%s ignorata da Telegram", draft_id[:8])
+        try:
+            ignore_draft(draft_id)
+            _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": "🗑 Email ignorata", "show_alert": False})
+            _edit_message(chat_id, message_id, "🗑 Email ignorata.")
+            logger.info("callback | draft_id=%s ignorata da Telegram", draft_id[:8])
+        except Exception as e:
+            _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": "❌ Errore", "show_alert": True})
 
     elif action == "snooze":
-        # Rimane pending — solo rimuove i bottoni dal messaggio Telegram
-        _edit_message(chat_id, message_id,
-                      "⏸ Lasciata per dopo — gestisci dalla dashboard.")
+        _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": "⏸ Rimandata", "show_alert": False})
+        _edit_message(chat_id, message_id, "⏸ Lasciata per dopo — gestisci dalla dashboard.")
         logger.info("callback | draft_id=%s snooze, bottoni rimossi", draft_id[:8])
 
     elif action == "modifica":
-        # Segna che questo chat è in attesa di istruzione per questa bozza
+        _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": "✏️ Modalità modifica", "show_alert": False})
         _pending_edits[str(chat_id)] = draft_id
         _tg_post("sendMessage", {
             "chat_id": chat_id,
-            "text":    "✏️ Scrivi la modifica da fare:",
+            "text":    "✏️ *Scrivi la modifica da fare:*\n(es: 'aggiungi uno sconto del 10%')",
+            "parse_mode": "Markdown"
         })
         logger.info("callback | draft_id=%s in attesa istruzione modifica", draft_id[:8])
 
@@ -231,13 +241,33 @@ def _process_draft_edit(chat_id: str, instruction: str) -> None:
     draft_id = _pending_edits.pop(chat_id)
     logger.info("modifica | draft_id=%s istruzione ricevuta: %s", draft_id[:8], instruction[:50])
 
-    anthropic_client = Anthropic()
-    result = refine_draft(draft_id, instruction, anthropic_client)
+    # Notifica "Lavoro in corso"
+    wait_msg = _tg_post("sendMessage", {"chat_id": chat_id, "text": "⏳ _Sto elaborando la modifica..._", "parse_mode": "Markdown"})
+    wait_msg_id = wait_msg.get("result", {}).get("message_id")
 
-    if not result:
-        _tg_post("sendMessage", {"chat_id": chat_id, "text": "⚠️ Errore nella modifica. Riprova."})
+    anthropic_client = Anthropic()
+    res = refine_draft(draft_id, instruction, anthropic_client)
+
+    if not res:
+        if wait_msg_id:
+            _tg_post("deleteMessage", {"chat_id": chat_id, "message_id": wait_msg_id})
+        _tg_post("sendMessage", {"chat_id": chat_id, "text": "⚠️ *Errore nella modifica.* Il server non ha risposto correttamente. Riprova tra poco.", "parse_mode": "Markdown"})
         return
 
+    new_sub, new_body, feedback = res
+
+    # Rimuovi messaggio di attesa
+    if wait_msg_id:
+        _tg_post("deleteMessage", {"chat_id": chat_id, "message_id": wait_msg_id})
+
+    # 1. Invia Feedback IA personalizzato
+    _tg_post("sendMessage", {
+        "chat_id": chat_id,
+        "text": f"✨ *Polpo AI:* {feedback}",
+        "parse_mode": "Markdown"
+    })
+
+    # 2. Rimanda la card aggiornata
     draft = get_draft_by_id(draft_id)
     if draft:
         _tg_post("sendMessage", {

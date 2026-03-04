@@ -220,10 +220,12 @@ def save_draft(
     final_intent:      str,
     reclassified:      bool = False,
     warning:           Optional[str] = None,
+    status:            str = "pending",
+    approved_by:       Optional[str] = None,
 ) -> dict:
     """Salva la bozza generata dal Responder."""
     db = get_client()
-    result = db.table("draft_responses").insert({
+    data = {
         "email_id":          email_id,
         "client_id":         client_id,
         "subject":           subject,
@@ -232,8 +234,13 @@ def save_draft(
         "final_intent":      final_intent,
         "reclassified":      reclassified,
         "warning":           warning,
-        "status":            "pending",
-    }).execute()
+        "status":            status,
+    }
+    if approved_by:
+        data["approved_by"] = approved_by
+        data["approved_at"] = datetime.now(timezone.utc).isoformat()
+        
+    result = db.table("draft_responses").insert(data).execute()
     return result.data[0]
 
 
@@ -404,6 +411,21 @@ def get_pending_emails(client_id: str, priority: Optional[int] = None, limit: in
     if priority:
         query = query.eq("priority", priority)
     result = query.order("received_at", desc=True).limit(limit).execute()
+    return result.data
+
+
+def get_approved_drafts() -> list[dict]:
+    """Cerca bozze che sono state approvate dall'utente e devono essere inviate."""
+    db = get_client()
+    # Recuperiamo info sulla bozza, sull'email originale e sulle credenziali SMTP del cliente
+    result = (
+        db.table("draft_responses")
+        .select("id, client_id, subject, body, email_id, "
+                "emails(sender_email, sender_name, subject), " # Rimosso message_id
+                "clients(smtp_host, smtp_port, smtp_user, smtp_password, name)")
+        .eq("status", "approved")
+        .execute()
+    )
     return result.data
 
 

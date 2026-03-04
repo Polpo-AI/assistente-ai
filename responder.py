@@ -163,7 +163,18 @@ Allegati: {', '.join(ctx.attachments) if ctx.attachments else 'nessuno'}
     )
 
     try:
-        data = json.loads(response.content[0].text.strip())
+        raw_text = response.content[0].text.strip()
+        logger.info("reclassify | raw response: %s", raw_text)
+        
+        # Estrazione robusta del JSON (gestisce markdown blocks ```json ... ```)
+        import re
+        json_match = re.search(r"\{.*\}", raw_text, re.DOTALL)
+        if json_match:
+            json_text = json_match.group(0)
+            data = json.loads(json_text)
+        else:
+            data = json.loads(raw_text)
+
         intent = data.get("intent", "altro")
         if intent not in config.intent_list:
             intent = "altro"
@@ -340,6 +351,12 @@ def generate_response_draft(
         actions.insert(0, "⚠️ Reclamo: revisionare con attenzione prima dell'invio")
 
     # ── Step 4: Salva bozza nel DB ────────────────────
+    draft_status = "pending"
+    approved_by = None
+    if ctx.priority == 1:
+        draft_status = "approved"
+        approved_by = "system_auto"
+
     draft_id = None
     try:
         draft_record = save_draft(
@@ -351,6 +368,8 @@ def generate_response_draft(
             final_intent=final_intent,
             reclassified=reclassified,
             warning=warning,
+            status=draft_status,
+            approved_by=approved_by,
         )
         draft_id = draft_record["id"]
         logger.info("responder | email_id=%s draft_id=%s salvato — intent=%s",
@@ -381,13 +400,13 @@ def refine_draft(
     draft_id: str,
     instruction: str,
     client: Anthropic,
-) -> Optional[tuple[str, str]]:
+) -> Optional[tuple[str, str, str]]:
     """
     Modifica una bozza esistente tramite istruzione in linguaggio naturale.
     Usato dal bot Telegram dopo click su "Modifica".
 
     Stateless: recupera bozza e config dal DB, chiama Sonnet, aggiorna il record.
-    Restituisce (nuovo_subject, nuovo_body) o None in caso di errore.
+    Restituisce (nuovo_subject, nuovo_body, feedback_ia) o None in caso di errore.
     """
     draft = get_draft_by_id(draft_id)
     if not draft:
@@ -404,33 +423,44 @@ def refine_draft(
         f"Stile: {tone}. Firma: {signature}.\n"
         "Ti viene fornita una bozza di email e un'istruzione di modifica. "
         "Applica la modifica e rispondi SOLO con JSON:\n"
-        '{"subject": "oggetto", "body": "corpo completo"}\n'
+        '{\n'
+        '  "subject": "oggetto",\n'
+        '  "body": "corpo completo",\n'
+        '  "feedback": "breve frase di conferma di ciò che hai fatto (es: Ho aggiunto lo sconto richiesto)"\n'
+        '}\n'
         "Non aggiungere testo fuori dal JSON."
     )
 
     user_content = (
         f"BOZZA ATTUALE:\nOggetto: {draft.get('subject', '')}\n\n{draft.get('body', '')}\n\n"
-        f"ISTRUZIONE: {instruction}"
+        f"ISTRUZIONE DI MODIFICA: {instruction}"
     )
 
     try:
         response = client.messages.create(
             model=RESPONDER_MODEL,
-            max_tokens=800,
+            max_tokens=1000,
             timeout=60.0,
             system=system,
             messages=[{"role": "user", "content": user_content}]
         )
         import re as _re
         raw = response.content[0].text.strip()
-        raw = _re.sub(r"^(?:```json\n?|```\n?)", "", raw)
-        raw = _re.sub(r"\n?```$", "", raw)
-        data = json.loads(raw)
+        
+        # Estrazione robusta JSON
+        json_match = _re.search(r"\{.*\}", raw, _re.DOTALL)
+        if json_match:
+            data = json.loads(json_match.group(0))
+        else:
+            data = json.loads(raw)
+            
         new_subject = data.get("subject", draft.get("subject", ""))
         new_body    = data.get("body", draft.get("body", ""))
+        feedback    = data.get("feedback", "Bozza aggiornata con successo.")
+        
         update_draft_body(draft_id, new_subject, new_body)
-        logger.info("refine_draft | draft_id=%s bozza aggiornata", draft_id[:8])
-        return new_subject, new_body
+        logger.info("refine_draft | draft_id=%s bozza aggiornata. Feedback: %s", draft_id[:8], feedback)
+        return new_subject, new_body, feedback
     except Exception as e:
         logger.error("refine_draft | draft_id=%s errore: %s", draft_id[:8], e)
         return None

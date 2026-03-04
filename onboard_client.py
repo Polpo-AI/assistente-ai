@@ -15,13 +15,21 @@ load_dotenv()
 # Helpers UI
 # ─────────────────────────────────────────────
 
+import textwrap
+
 def titolo(testo):
     print(f"\n{'='*55}")
     print(f"  {testo}")
     print(f"{'='*55}")
 
 def sezione(testo):
-    print(f"\n-- {testo} --")
+    print(f"\n-- {testo.upper()} --")
+
+def print_wrap(testo, indent="    ", width=80):
+    """Stampa testo con a capo automatico per terminale."""
+    if not testo: return
+    wrapped = textwrap.fill(testo, width=width, initial_indent=indent, subsequent_indent=indent)
+    print(wrapped)
 
 def chiedi(domanda, default=""):
     hint = f" [{default}]" if default else ""
@@ -389,9 +397,11 @@ def raccogli_dati():
         print("\n  Istruzioni caricate dall'IA. Puoi modificarle se necessario:")
         for intent in intenti:
             if intent in ("spam", "altro"): continue
-            print(f"    - {intent}: {intent_instructions.get(intent, 'default')[:60]}...")
+            print(f"\n    [ {intent.upper()} ]")
+            istruzione = intent_instructions.get(intent, 'default')
+            print_wrap(istruzione, indent="      ")
             if conferma(f"      Vuoi modificare l'istruzione per '{intent}'?"):
-                intent_instructions[intent] = chiedi(f"      Nuova istruzione per '{intent}'", intent_instructions.get(intent, ""))
+                intent_instructions[intent] = chiedi(f"      Nuova istruzione per '{intent}'", istruzione)
 
     dati["intent_instructions"] = intent_instructions
 

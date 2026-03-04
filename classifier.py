@@ -244,7 +244,15 @@ Allegati: {', '.join(msg.attachments) if msg.attachments else 'nessuno'}
     raw = response.content[0].text.strip()
 
     try:
-        data = json.loads(raw)
+        # Estrazione robusta del JSON (gestisce markdown blocks ```json ... ```)
+        import re
+        json_match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if json_match:
+            json_text = json_match.group(0)
+            data = json.loads(json_text)
+        else:
+            data = json.loads(raw)
+
         intent = data.get("intent", "altro")
         if intent not in config.intent_list:
             intent = "altro"
