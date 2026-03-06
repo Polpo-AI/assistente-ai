@@ -3,6 +3,7 @@ client_config.py - Configurazione per cliente (Multi-Tenant)
 
 Legge da Supabase la configurazione completa del cliente:
 - persona LLM e lingua
+- descrizione azienda e servizi offerti
 - intenti e priorita
 - keyword spam
 - istruzioni per intent
@@ -35,7 +36,9 @@ class ClientConfig:
     contacts:             dict
     orari:                dict
     faq:                  list
-    telegram_chat_id:     Optional[str] = None  # None se il cliente non usa Telegram
+    business_description: str = ""   # Chi è l'azienda, cosa fa, storia
+    services_offered:     str = ""   # Lista servizi offerti (definisce l'in-scope)
+    telegram_chat_id:     Optional[str] = None
 
     def all_intents_str(self) -> str:
         return " | ".join(f'"{i}"' for i in self.intent_list)
@@ -83,6 +86,22 @@ class ClientConfig:
         for item in self.faq:
             lines.append(f"  D: {item.get('domanda', '')}")
             lines.append(f"  R: {item.get('risposta', '')}")
+        return "\n".join(lines)
+
+    def format_business_context(self) -> str:
+        """
+        Formatta descrizione e servizi per inserirli nel prompt LLM.
+        Usato da classifier e responder per capire cosa è in-scope.
+        """
+        lines = []
+        if self.business_description:
+            lines.append(f"Descrizione azienda: {self.business_description}")
+        if self.services_offered:
+            lines.append(f"Servizi offerti: {self.services_offered}")
+            lines.append(
+                "IMPORTANTE: Qualsiasi richiesta di servizi NON inclusi nell'elenco "
+                "sopra è da considerarsi OUT-OF-SCOPE e deve essere classificata di conseguenza."
+            )
         return "\n".join(lines)
 
 
@@ -181,6 +200,8 @@ def get_client_config(client_id: str, force_refresh: bool = False) -> Optional[C
         contacts=parse_json_field(row.get("contacts"), {}),
         orari=parse_json_field(row.get("orari"), {}),
         faq=parse_json_field(row.get("faq"), []),
+        business_description=row.get("business_description", ""),
+        services_offered=row.get("services_offered", ""),
         telegram_chat_id=row.get("telegram_chat_id"),
     )
 
