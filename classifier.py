@@ -87,7 +87,7 @@ def _is_trivial(
     # Bounce e mittenti automatici — sempre filtrati
     if any(re.search(p, sender) for p in NOREPLY_PATTERNS):
         return ClassificationResult(
-            contact_type="automatico", intent="cortesia", priority=0,
+            contact_type="sconosciuto", intent="cortesia", priority=0,
             confidence=0.99, classified_by="filter",
             summary="Mittente automatico o noreply — nessuna risposta necessaria.",
         )

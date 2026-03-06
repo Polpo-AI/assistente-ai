@@ -574,7 +574,7 @@ async def process_email(client_id: str, email_data: dict) -> None:
 
     email_id = result.db_ids["email_id"]
     logger.info("worker.process | [%s] Classificata → intent=%s thread_topic=%s priority=%d (email_id=%s)",
-                client_name, result.intent, result.thread_topic or "—",
+                client_name, result.intent,
                 result.priority, email_id)
 
     # 2. Salva enrichments nel DB
@@ -587,7 +587,7 @@ async def process_email(client_id: str, email_data: dict) -> None:
         quoted_text=email_data.get("quoted_text", ""),
         quoted_nested=email_data.get("quoted_nested", False),
         detected_language=email_data.get("detected_language", ""),
-        thread_topic=result.thread_topic or "",
+        thread_topic="",
     )
 
     # 3. Allegati — screening Haiku + estrazione Sonnet
