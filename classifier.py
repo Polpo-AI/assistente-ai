@@ -1,17 +1,32 @@
 """
-[AI REFERENCE] Per una visione d'insieme dell'architettura e del flusso logico, 
+[AI REFERENCE] Per una visione d'insieme dell'architettura e del flusso logico,
 leggere il file: PROJECT_SUMMARY.md
 """
 
 """
-Email Classifier - Cascade Pipeline (v3 Multi-Tenant)
+Email Classifier — Pipeline LLM-First (v6 Multi-Tenant)
 
-Livello 1: Lookup DB (mittente noto per questo cliente)
-Livello 2: Regole deterministiche (keyword spam + intent patterns)
-Livello 3: LLM Haiku (fallback)
+Architettura:
 
-La configurazione (persona, intenti, keyword spam) viene letta da ClientConfig
-quindi il bot si adatta automaticamente al settore del cliente.
+  Livello 1 — Filtro triviale (zero token, zero LLM)
+    Casi banali che non richiedono ragionamento:
+    - Mittenti automatici / noreply
+    - Messaggi di cortesia brevi senza contenuto azionabile
+
+  Livello 2 — DB Lookup
+    Se il mittente è in rubrica, il contact_type è già noto.
+    Viene passato come hint all'LLM ma non bypassa la classificazione.
+
+  Livello 3 — Haiku con contesto completo
+    Classifica SEMPRE con LLM. Niente regole keyword.
+    Contesto passato:
+    - Corpo email pulito
+    - Thread completo (quoted_text) — sempre incluso se presente
+    - Nomi allegati (il testo estratto lo legge Sonnet nel responder)
+    - Business context del cliente (settore, servizi, out-of-scope)
+    - Lingua rilevata dal worker
+    - contact_type hint se mittente noto
+
 """
 
 import re
@@ -20,49 +35,22 @@ import logging
 from dataclasses import dataclass, field
 from typing import Optional
 from anthropic import Anthropic
+import anthropic
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from dotenv import load_dotenv
 
 from database import persist_classified_email, get_contact_by_email
 from client_config import ClientConfig, get_client_config
-
-logger = logging.getLogger("polpo.classifier")
-
-# ─────────────────────────────────────────────
-# Costanti globali (non dipendono dal cliente)
-# ─────────────────────────────────────────────
-
-BASE_SPAM_KEYWORDS = [
-    "unsubscribe", "offerta esclusiva", "hai vinto", "clicca qui",
-    "guadagna da casa", "verifica il tuo account", "noreply@",
-]
-
-from dotenv import load_dotenv
+from attachment_reader import get_quoted_text_from_db
 
 load_dotenv()
+logger = logging.getLogger("polpo.classifier")
 
-# Pattern intent di base — vengono usati solo come fallback
-# se il cliente non ha intent personalizzati
-BASE_INTENT_PATTERNS = {
-    "preventivo":    r"\b(preventivo|stima|quanto costa|costo|quotazione|offerta)\b",
-    "appuntamento":  r"\b(appuntamento|prenotare|disponibilit|quando posso|orario)\b",
-    "reclamo":       r"\b(reclamo|lamentela|problema|non funziona|deluso|insoddisfatto)\b",
-    "pagamento":     r"\b(pagamento|fattura|bonifico|ricevuta|saldo)\b",
-    "informazione":  r"\b(informazioni|info|chiedo|volevo sapere|domanda)\b",
-}
 
-PRIORITY_MAP = {
-    "reclamo":      3,
-    "urgenza":      3,   # intent custom per es. dentisti
-    "preventivo":   2,
-    "appuntamento": 2,
-    "pagamento":    2,
-    "informazione": 1,
-    "info":         1,
-    "spam":         0,   # spam, marketing, phishing → non rispondere
-    "altro":        1,
-    "cortesia":     0,   # ringraziamenti, conferme, no-reply → non rispondere
-}
+# ─────────────────────────────────────────────
+# Livello 1 — Filtro triviale (zero token)
+# ─────────────────────────────────────────────
 
-# Pattern mittenti automatici/noreply — controllati prima di tutto
 NOREPLY_PATTERNS = [
     r"no.?reply", r"do.?not.?reply", r"noreply",
     r"mailer.daemon", r"postmaster",
@@ -70,8 +58,57 @@ NOREPLY_PATTERNS = [
     r"auto.?reply", r"automated?@",
 ]
 
-# Pattern per messaggi di cortesia non azionabili
+# Solo parole di cortesia pura — usate con soglia caratteri molto bassa
 CORTESIA_PATTERN = r"\b(grazie\s*mille|grazie|perfetto|ricevuto|ok\s+grazie|ottimo|capito|va\s+bene|thank\s+you|thanks)\b"
+
+# Soglia massima caratteri per filtro cortesia
+# Sotto questa soglia + parola cortesia + nessun "?" = sicuramente non azionabile
+CORTESIA_MAX_CHARS = 35
+
+
+def _is_trivial(
+    sender_email: str,
+    subject: str,
+    body: str,
+    has_thread: bool = False,
+) -> Optional["ClassificationResult"]:
+    """
+    Filtro conservativo — filtra solo i casi in cui siamo al 100% sicuri.
+
+    Bounce/noreply: sempre filtrati, anche con thread.
+    Cortesia: filtrata SOLO se:
+      - corpo sotto i 35 caratteri
+      - contiene parola di cortesia
+      - nessun punto interrogativo (domanda = azionabile)
+      - NON c'è un thread (con thread passa sempre a Haiku)
+    """
+    sender = sender_email.lower()
+
+    # Bounce e mittenti automatici — sempre filtrati
+    if any(re.search(p, sender) for p in NOREPLY_PATTERNS):
+        return ClassificationResult(
+            contact_type="automatico", intent="cortesia", priority=0,
+            confidence=0.99, classified_by="filter",
+            summary="Mittente automatico o noreply — nessuna risposta necessaria.",
+        )
+
+    # Con thread → passa sempre a Haiku, qualunque cosa dica il corpo
+    if has_thread:
+        return None
+
+    # Cortesia pura: corpo cortissimo, nessuna domanda, nessun thread
+    body_clean = body.strip()
+    text       = (subject + " " + body_clean).lower()
+    if (len(body_clean) <= CORTESIA_MAX_CHARS
+            and re.search(CORTESIA_PATTERN, text, re.IGNORECASE)
+            and "?" not in body_clean):
+        return ClassificationResult(
+            contact_type="sconosciuto", intent="cortesia", priority=0,
+            confidence=0.95, classified_by="filter",
+            summary="Messaggio di cortesia non azionabile — nessuna risposta necessaria.",
+        )
+
+    return None
 
 
 # ─────────────────────────────────────────────
@@ -80,207 +117,144 @@ CORTESIA_PATTERN = r"\b(grazie\s*mille|grazie|perfetto|ricevuto|ok\s+grazie|otti
 
 @dataclass
 class InboundMessage:
-    sender_email: str
-    sender_name:  str
-    subject:      str
-    body:         str
-    attachments:  list[str] = field(default_factory=list)
+    sender_email:      str
+    sender_name:       str
+    subject:           str
+    body:              str
+    attachments:       list[str] = field(default_factory=list)
+    detected_language: str = "unknown"
+    in_reply_to:       str = ""    # header RFC822 per threading corretto
 
 @dataclass
 class ClassificationResult:
     contact_type:    str
-    intent:          str
-    priority:        int            # 0=non rispondere, 1=bassa, 2=media, 3=urgente
+    intent:          str            # intent dell'email CORRENTE
+    priority:        int            # 0=no reply, 1=bassa, 2=media, 3=urgente
     confidence:      float
-    classified_by:   str            # "db_lookup"|"rules"|"llm"|"llm_fallback"
-    summary:         str
+    classified_by:   str            # "filter" | "llm" | "llm_fallback"
+    summary:         str            # descrive l'intent corrente, non il thread
     estimated_value: Optional[float] = None
     db_ids:          Optional[dict] = None
 
 
 # ─────────────────────────────────────────────
-# Livello 1 — DB Lookup
+# Livello 2 — DB Lookup (hint per LLM)
 # ─────────────────────────────────────────────
 
 def lookup_contact(client_id: str, email: str, use_real_db: bool = True) -> Optional[dict]:
-    """Cerca mittente nel DB del cliente specifico."""
     if use_real_db:
         return get_contact_by_email(client_id, email)
-
-    # Mock offline per test
     mock = {
-        "mario.rossi@example.com": {"contact_type": "cliente", "name": "Mario Rossi"},
+        "mario.rossi@example.com": {"contact_type": "cliente",   "name": "Mario Rossi"},
         "ricambi@fornitore.it":    {"contact_type": "fornitore", "name": "Ricambi SpA"},
-        "noreply@promo.com":       {"contact_type": "spam", "name": "Promo"},
+        "noreply@promo.com":       {"contact_type": "spam",      "name": "Promo"},
     }
     return mock.get(email.lower())
 
 
 # ─────────────────────────────────────────────
-# Livello 2 — Regole Deterministiche
+# Livello 3 — Haiku LLM-First
 # ─────────────────────────────────────────────
 
-def apply_rules(msg: InboundMessage, config: ClientConfig) -> Optional[ClassificationResult]:
-    """
-    Applica regole basate su keyword e pattern.
-    Usa la configurazione del cliente (spam keywords extra, intent list).
-    """
-    text = (msg.subject + " " + msg.body).lower()
-    sender = msg.sender_email.lower()
+def _build_system_prompt(
+    config: ClientConfig,
+    existing_contact_types: list = None,
+    detected_language: str = "unknown",
+) -> str:
+    contact_type_hint = (
+        f"Valori già usati per questo cliente (preferisci questi): {', '.join(existing_contact_types)}"
+        if existing_contact_types
+        else "es: cliente, fornitore, partner, candidato, istituzione"
+    )
 
-    # Priorità 0 — Mittenti automatici/noreply: non rispondere
-    if any(re.search(p, sender) for p in NOREPLY_PATTERNS):
-        return ClassificationResult(
-            contact_type="automatico",
-            intent="cortesia",
-            priority=0,
-            confidence=0.99,
-            classified_by="rules",
-            summary="Mittente automatico o noreply — nessuna risposta necessaria."
-        )
+    language_note = ""
+    if detected_language and detected_language not in ("unknown", "it"):
+        language_note = f"\nNOTA LINGUA: L'email è scritta in '{detected_language}'."
 
-    # Priorità 0 — Messaggi di cortesia non azionabili
-    # Scatta solo se: body corto E contiene cortesia E NON contiene parole azionabili
-    ACTIONABLE_PATTERN = r"\b(preventivo|spedizione|tracking|ritiro|consegna|tariffa|prezzo|costo|pacco|ordine|fattura|pagamento|reclamo|problema|urgente|appuntamento|informazioni?|richiesta|aiuto)\b"
-    body_short = msg.body.strip()
-    if (len(body_short) < 120
-            and re.search(CORTESIA_PATTERN, text, re.IGNORECASE)
-            and not re.search(ACTIONABLE_PATTERN, text, re.IGNORECASE)):
-        return ClassificationResult(
-            contact_type="sconosciuto",
-            intent="cortesia",
-            priority=0,
-            confidence=0.90,
-            classified_by="rules",
-            summary="Messaggio di cortesia non azionabile — nessuna risposta necessaria."
-        )
+    business_context = config.format_business_context()
+    business_block   = f"\n\n{business_context}" if business_context else ""
 
-    # Spam: keywords base + quelle custom del cliente
-    all_spam_kw = BASE_SPAM_KEYWORDS + config.custom_spam_keywords
-    if any(kw in text for kw in all_spam_kw):
-        return ClassificationResult(
-            contact_type="spam",
-            intent="spam",
-            priority=1,
-            confidence=0.95,
-            classified_by="rules",
-            summary="Messaggio spam rilevato da keyword matching."
-        )
+    return f"""{config.llm_persona}{business_block}
 
-    # Intent detection: 1. Custom keywords del cliente (Priorità)
-    if config.intent_keywords:
-        for intent, keywords in config.intent_keywords.items():
-            if intent not in config.intent_list:
-                continue
-            for kw in keywords:
-                if kw.lower() in text:
-                    return ClassificationResult(
-                        contact_type="sconosciuto",
-                        intent=intent,
-                        priority=config.priority_map.get(intent, PRIORITY_MAP.get(intent, 1)),
-                        confidence=0.90,  # Alta confidence per match esatto impostato dal cliente
-                        classified_by="rules",
-                        summary=f"Intent rilevato via keyword personalizzata '{kw}': {intent}."
-                    )
-
-    # Intent detection: 2. Pattern base (Fallback)
-    for intent, pattern in BASE_INTENT_PATTERNS.items():
-        # Salta intent non presenti nella lista del cliente
-        if intent not in config.intent_list:
-            continue
-        if re.search(pattern, text, re.IGNORECASE):
-            return ClassificationResult(
-                contact_type="sconosciuto",
-                intent=intent,
-                priority=config.priority_map.get(intent, PRIORITY_MAP.get(intent, 1)),
-                confidence=0.75,
-                classified_by="rules",
-                summary=f"Intent rilevato via pattern base: {intent}. Mittente non in rubrica."
-            )
-
-    return None  # → passa al LLM
-
-
-# ─────────────────────────────────────────────
-# Livello 3 — LLM Haiku (con config cliente)
-# ─────────────────────────────────────────────
-
-def _build_llm_prompt(config: ClientConfig, existing_contact_types: list = None) -> str:
-    """Costruisce il system prompt dinamicamente dalla config del cliente."""
-    if existing_contact_types:
-        contact_type_hint = f"Valori già usati per questo cliente (preferisci questi se appropriato): {', '.join(existing_contact_types)}"
-    else:
-        contact_type_hint = "es: cliente, fornitore, partner, candidato, istituzione"
-
-    return f"""{config.llm_persona}
-Analizza il messaggio email e rispondi SOLO con un JSON valido:
+Analizza l'email e rispondi SOLO con JSON valido:
 {{
-  "contact_type": chi è strutturalmente il mittente come soggetto (NON l'intent della mail — NON usare mai valori come 'cortesia', 'spam', 'informazione' che descrivono il contenuto; usa invece il ruolo del mittente, {contact_type_hint}),
+  "contact_type": "ruolo strutturale del mittente ({contact_type_hint})",
   "intent": {config.all_intents_str()} | "spam",
   "priority": 0 | 1 | 2 | 3,
   "confidence": 0.0-1.0,
-  "summary": "max 100 caratteri",
+  "summary": "max 100 caratteri — descrivi cosa chiede il mittente IN QUESTA EMAIL",
   "estimated_value": null oppure float se preventivo con valore stimabile
 }}
 
-REGOLE DI PRIORITA':
-- 0 (ZERO ASSOLUTO): usa TASSATIVAMENTE per spam, pubblicità non richiesta, phishing, email automatiche, ringraziamenti e SOPRATTUTTO per richieste fuori settore (Out of Scope, es. richieste di servizi web per un'azienda di trasporti). Se priorità è 0 per posta indesiderata/OOS imposta "intent": "spam".
-- 1: bassa (info generiche non urgenti pertinenti al settore)
-- 2: media (preventivi, appuntamenti, pagamenti reali pertinenti)
-- 3: urgente (reclami gravi, urgenze operative in target)
 
+PRIORITÀ:
+- 0: spam, pubblicità, phishing, automatiche, cortesia pura, OUT-OF-SCOPE. Se 0 → intent="spam"
+- 1: informazioni generiche non urgenti
+- 2: preventivi, appuntamenti, pagamenti
+- 3: reclami gravi, urgenze operative
+{language_note}
 Non aggiungere testo fuori dal JSON."""
 
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-import anthropic
 
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=2, max=10),
     retry=retry_if_exception_type((anthropic.APIError, anthropic.APIConnectionError, anthropic.RateLimitError)),
-    before_sleep=lambda retry_state: logger.warning(f"Retrying LLM classification... Attempt {retry_state.attempt_number}")
+    before_sleep=lambda rs: logger.warning("Retry classificazione LLM... tentativo %d", rs.attempt_number)
 )
 def classify_with_llm(
     msg: InboundMessage,
     config: ClientConfig,
     client: Anthropic,
+    quoted_text: str = "",
+    contact_type_hint: Optional[str] = None,
 ) -> ClassificationResult:
-    """Classificazione via Haiku — solo quando regole e DB non bastano."""
+    """
+    Classificazione completa con Haiku.
+    Passa sempre il thread completo se presente — niente ambiguità di contesto.
+    """
     from database import get_existing_contact_types
-    existing_contact_types = get_existing_contact_types(config.client_id)
-
-    user_content = f"""
-Da: {msg.sender_name} <{msg.sender_email}>
-Oggetto: {msg.subject}
-Allegati: {', '.join(msg.attachments) if msg.attachments else 'nessuno'}
-
----
-{msg.body[:1500]}
-"""
     from models_config import CLASSIFIER_MODEL
+
+    existing_ct   = get_existing_contact_types(config.client_id)
+    system_prompt = _build_system_prompt(config, existing_ct, msg.detected_language)
+
+    att_names     = ", ".join(msg.attachments) if msg.attachments else "nessuno"
+    thread_block  = (
+        f"\n\n--- STORICO THREAD ---\n{quoted_text}\n--- FINE THREAD ---"
+        if quoted_text else ""
+    )
+    contact_block = (
+        f"\nMittente in rubrica come: {contact_type_hint}"
+        if contact_type_hint else ""
+    )
+
+    user_content = f"""Da: {msg.sender_name} <{msg.sender_email}>
+Oggetto: {msg.subject}
+Allegati: {att_names}{contact_block}
+
+--- EMAIL CORRENTE ---
+{msg.body[:2000]}{thread_block}
+"""
+
     response = client.messages.create(
         model=CLASSIFIER_MODEL,
-        max_tokens=300,
+        max_tokens=400,
         timeout=30.0,
-        system=_build_llm_prompt(config, existing_contact_types),
+        system=system_prompt,
         messages=[{"role": "user", "content": user_content}]
     )
 
     raw = response.content[0].text.strip()
 
     try:
-        # Estrazione robusta del JSON (gestisce markdown blocks ```json ... ```)
-        import re
         json_match = re.search(r"\{.*\}", raw, re.DOTALL)
-        if json_match:
-            json_text = json_match.group(0)
-            data = json.loads(json_text)
-        else:
-            data = json.loads(raw)
+        data       = json.loads(json_match.group(0) if json_match else raw)
 
         intent = data.get("intent", "altro")
-        if intent not in config.intent_list:
+        if intent not in config.intent_list and intent != "spam":
             intent = "altro"
+
         result = ClassificationResult(
             contact_type=data.get("contact_type", "sconosciuto"),
             intent=intent,
@@ -292,26 +266,21 @@ Allegati: {', '.join(msg.attachments) if msg.attachments else 'nessuno'}
         )
         logger.info("llm_classify | intent=%s conf=%.2f", result.intent, result.confidence)
         return result
+
     except (json.JSONDecodeError, ValueError) as e:
         logger.warning("llm_classify | JSON parsing fallito: %s | raw=%s", e, raw[:100])
         return ClassificationResult(
-            contact_type="sconosciuto",
-            intent="altro",
-            priority=2,
-            confidence=0.3,
-            classified_by="llm_fallback",
+            contact_type="sconosciuto", intent="altro", priority=2,
+            confidence=0.3, classified_by="llm_fallback",
             summary="Classificazione LLM fallita, richiede revisione manuale."
-        )
+            )
     except Exception as e:
         logger.error("llm_classify | Errore inatteso: %s", e)
         return ClassificationResult(
-            contact_type="sconosciuto",
-            intent="altro",
-            priority=2,
-            confidence=0.0,
-            classified_by="llm_fallback",
+            contact_type="sconosciuto", intent="altro", priority=2,
+            confidence=0.0, classified_by="llm_fallback",
             summary="Errore LLM, richiede revisione manuale."
-        )
+            )
 
 
 # ─────────────────────────────────────────────
@@ -323,70 +292,63 @@ def classify_message(
     client_id: str,
     llm_client: Anthropic = None,
     config: Optional[ClientConfig] = None,
-    llm_confidence_threshold: float = 0.70,
     save_to_db: bool = True,
     use_real_db: bool = True,
+    quoted_text: str = "",      # passato dal worker dopo lo strip del thread
 ) -> ClassificationResult:
     """
-    Pipeline di classificazione a cascata per un cliente specifico.
+    Pipeline classificazione LLM-First.
 
-    1. Carica config cliente (persona, intenti, spam keywords)
-    2. Lookup DB contatti del cliente
-    3. Regole deterministiche personalizzate
-    4. LLM Haiku con persona del cliente
-    5. Salva tutto su Supabase
+    1. Filtro triviale (bounce, cortesia) — zero token
+    2. DB Lookup — recupera contact_type se mittente noto (hint per LLM)
+    3. Haiku con contesto completo (corpo + thread + allegati + business context)
+    4. Salva su Supabase
     """
 
-    # ── Config cliente ────────────────────────
     if not config:
         config = get_client_config(client_id) if use_real_db else _mock_config(client_id)
     if not config:
         raise ValueError(f"Cliente {client_id} non trovato o non attivo.")
 
-    # ── Livello 1: DB Lookup ──────────────────
-    contact = lookup_contact(client_id, msg.sender_email, use_real_db)
-    if contact:
-        contact_type = contact.get("contact_type", "sconosciuto")
-        rule_result = apply_rules(msg, config)
-        intent = rule_result.intent if rule_result else "altro"
-        logger.info("classify | client=%s email=%s level=db_lookup intent=%s",
-                    client_id[:8], msg.sender_email, intent)
-        result = ClassificationResult(
-            contact_type=contact_type,
-            intent=intent,
-            priority=_compute_priority(contact_type, intent, config),
-            confidence=0.95,
-            classified_by="db_lookup",
-            summary=f"{contact.get('name', msg.sender_name)} ({contact_type}): {intent}"
-        )
+    # Livello 1 — filtro triviale
+    trivial = _is_trivial(msg.sender_email, msg.subject, msg.body, has_thread=bool(quoted_text))
+    if trivial:
+        logger.info("classify | client=%s email=%s level=filter intent=%s",
+                    client_id[:8], msg.sender_email, trivial.intent)
+        result = trivial
 
     else:
-        # ── Livello 2: Regole ────────────────
-        rule_result = apply_rules(msg, config)
-        if rule_result and rule_result.confidence >= llm_confidence_threshold:
-            logger.info("classify | client=%s email=%s level=rules intent=%s",
-                        client_id[:8], msg.sender_email, rule_result.intent)
-            result = rule_result
+        # Livello 2 — DB lookup (hint)
+        contact           = lookup_contact(client_id, msg.sender_email, use_real_db)
+        contact_type_hint = contact.get("contact_type") if contact else None
 
-        # ── Livello 3: LLM Haiku ─────────────────
-        elif llm_client:
-            logger.info("classify | client=%s email=%s level=llm_haiku",
-                        client_id[:8], msg.sender_email)
-            result = classify_with_llm(msg, config, llm_client)
+        # Livello 3 — Haiku
+        if llm_client:
+            logger.info("classify | client=%s email=%s level=llm has_thread=%s",
+                        client_id[:8], msg.sender_email, bool(quoted_text))
+
+            result = classify_with_llm(
+                msg=msg,
+                config=config,
+                client=llm_client,
+                quoted_text=quoted_text,
+                contact_type_hint=contact_type_hint,
+            )
+
+            # Il contact_type dal DB ha sempre precedenza su quello inferito dall'LLM
+            if contact_type_hint:
+                result.contact_type = contact_type_hint
 
         else:
-            logger.warning("classify | client=%s email=%s level=none — nessun classificatore disponibile",
+            logger.warning("classify | client=%s email=%s — nessun LLM disponibile",
                            client_id[:8], msg.sender_email)
             result = ClassificationResult(
-                contact_type="sconosciuto",
-                intent="altro",
-                priority=2,
-                confidence=0.0,
-                classified_by="none",
+                contact_type="sconosciuto", intent="altro", priority=2,
+                confidence=0.0, classified_by="none",
                 summary="Classificazione non riuscita. Richiede revisione manuale."
             )
 
-    # ── Livello 4: Salvataggio DB ──────────────────
+    # Salvataggio DB
     if save_to_db and use_real_db:
         try:
             db_ids = persist_classified_email(
@@ -403,9 +365,10 @@ def classify_message(
                 classified_by=result.classified_by,
                 summary=result.summary,
                 estimated_value=result.estimated_value,
+                in_reply_to=msg.in_reply_to,
             )
             result.db_ids = db_ids
-            logger.info("classify | salvato su DB — email_id=%s intent=%s priority=%d",
+            logger.info("classify | DB — email_id=%s intent=%s priority=%d",
                         db_ids["email_id"][:8], result.intent, result.priority)
         except Exception as e:
             logger.error("classify | Errore salvataggio DB: %s", e)
@@ -413,22 +376,11 @@ def classify_message(
     return result
 
 
-def _compute_priority(contact_type: str, intent: str, config: "ClientConfig" = None) -> int:
-    """Priorità da combinazione contatto + intent.
-    Usa prima il priority_map del cliente (se disponibile), poi il default globale."""
-    client_map = config.priority_map if config else {}
-    if intent in ("reclamo", "urgenza"):
-        return client_map.get(intent, PRIORITY_MAP.get(intent, 3))
-    if contact_type == "cliente" and intent == "preventivo":
-        return client_map.get(intent, PRIORITY_MAP.get(intent, 2))
-    if contact_type == "fornitore":
-        return client_map.get(intent, PRIORITY_MAP.get(intent, 1))
-    return client_map.get(intent, PRIORITY_MAP.get(intent, 1))
-
+# ─────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────
 
 def _mock_config(client_id: str) -> ClientConfig:
-    """Config mock per test offline."""
-    from client_config import ClientConfig
     return ClientConfig(
         client_id=client_id,
         name="Officina Test",
@@ -457,46 +409,54 @@ if __name__ == "__main__":
     from client_config import get_client_id_by_name
 
     anthropic_client = Anthropic()
-
-    # Prende il client_id del cliente demo dal DB reale
-    CLIENT_ID = get_client_id_by_name("Officina Demo")
+    CLIENT_ID        = get_client_id_by_name("Officina Demo")
     if not CLIENT_ID:
-        print("❌ Cliente 'Officina Demo' non trovato. Hai eseguito schema.sql?")
+        print("❌ Cliente 'Officina Demo' non trovato.")
         exit(1)
 
     print(f"✅ Client ID trovato: {CLIENT_ID[:8]}…")
 
     msgs = [
+        # Thread in corso: oggetto con Re:, body breve ambiguo
         InboundMessage(
             sender_email="mario.rossi@example.com",
             sender_name="Mario Rossi",
-            subject="Preventivo riparazione paraurti",
-            body="Buongiorno, vorrei un preventivo per la sostituzione del paraurti della mia Fiat Panda."
+            subject="Re: Preventivo riparazione paraurti",
+            body="Perfetto, confermo. A che ora posso venire?",
         ),
+        # Nuova email multi-intent
+        InboundMessage(
+            sender_email="anna.verdi@gmail.com",
+            sender_name="Anna Verdi",
+            subject="Preventivo e sede",
+            body="Buongiorno, vorrei un preventivo per la sostituzione del paraurti. Inoltre mi può indicare la vostra sede e gli orari?",
+        ),
+        # Reclamo diretto
         InboundMessage(
             sender_email="luca.bianchi@gmail.com",
             sender_name="Luca Bianchi",
-            subject="Problema con la mia auto",
-            body="Salve, la settimana scorsa ho fatto riparare la mia auto da voi e il problema persiste. Sono molto deluso.",
-            attachments=["foto_danno.jpg"]
+            subject="Problema irrisolto",
+            body="Salve, ho fatto riparare la mia auto da voi la settimana scorsa e il problema persiste. Sono molto deluso.",
         ),
     ]
 
-    for i, msg in enumerate(msgs, 1):
+    quoted_texts = [
+        "Il giorno 3 marzo, Officina Demo ha scritto:\n> Le inviamo il preventivo: sostituzione paraurti €350 + manodopera €80.",
+        "",
+        "",
+    ]
+
+    for i, (msg, qt) in enumerate(zip(msgs, quoted_texts), 1):
         result = classify_message(
-            msg,
-            client_id=CLIENT_ID,
+            msg, client_id=CLIENT_ID,
             llm_client=anthropic_client,
-            use_real_db=True,      # ← Supabase reale
-            save_to_db=True,       # ← salva i risultati
+            use_real_db=True, save_to_db=False,
+            quoted_text=qt,
         )
-        print(f"\n{'='*50}")
+        print(f"\n{'='*55}")
         print(f"TEST {i}: {msg.subject}")
-        print(f"  Tipo contatto : {result.contact_type}")
-        print(f"  Intent        : {result.intent}")
-        print(f"  Priorità      : {result.priority}")
-        print(f"  Confidence    : {result.confidence:.0%}")
-        print(f"  Classificato  : {result.classified_by}")
-        print(f"  Sintesi       : {result.summary}")
-        if result.db_ids:
-            print(f"  ✅ Salvato su DB — email_id: {result.db_ids['email_id'][:8]}…")
+        print(f"  Intent       : {result.intent}")
+        print(f"  Priorità     : {result.priority}")
+        print(f"  Confidence   : {result.confidence:.0%}")
+        print(f"  By           : {result.classified_by}")
+        print(f"  Summary      : {result.summary}")

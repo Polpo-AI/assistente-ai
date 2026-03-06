@@ -6,41 +6,44 @@ Funzioni principali:
   1. IMAP Polling loop  → controlla nuove email ogni 60s per ogni cliente attivo
   2. Approved Watcher   → controlla ogni 30s le bozze approvate e le invia via SMTP
 
-Dipendenze:
-    pip install aiosmtplib aioimaplib python-dotenv
+Novità v3:
+  - Strip quoted text anti-matriosca: salva solo il primo livello, non l'intera catena
+  - Threading: salva message_id, in_reply_to, references per ricostruzione thread via query
+  - Outbound tracking: al momento dell'invio SMTP crea un record emails con direction='outbound'
+  - Message-ID generato da noi prima dell'invio (controllo totale)
+  - Estrazione allegati (PDF via Sonnet, DOCX/XLSX via librerie)
+  - Rilevamento lingua (langdetect)
+  - Bounce detection estesa
 
-Configurazione per cliente in Supabase (tabella clients):
-    imap_host, imap_port, imap_user, imap_password
-    smtp_host, smtp_port, smtp_user, smtp_password
-    imap_last_uid  → UID dell'ultima email processata (evita duplicati)
+Dipendenze:
+    pip install aiosmtplib aioimaplib python-dotenv langdetect python-docx openpyxl
 """
 
 import asyncio
 import logging
 import os
+import re
 import email as email_lib
 import email.policy
+import email.utils
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timezone
 from typing import Optional
+import uuid
 
 import aioimaplib
 import aiosmtplib
 from dotenv import load_dotenv
 
-# Import interni Polpo AI
-from database import get_client as get_db, mark_email_no_reply
+from database import get_client as get_db, mark_email_no_reply, mark_draft_generation_failed
 from classifier import classify_message, InboundMessage
 from responder import generate_response_draft
 import telegram_bot
 from anthropic import Anthropic
+from attachment_reader import process_email_attachments
 
 load_dotenv()
-
-# ─────────────────────────────────────────────
-# Logging
-# ─────────────────────────────────────────────
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,35 +52,145 @@ logging.basicConfig(
 )
 logger = logging.getLogger("polpo.worker")
 
-# ─────────────────────────────────────────────
-# Costanti
-# ─────────────────────────────────────────────
-
-IMAP_POLL_INTERVAL     = 60   # secondi tra un controllo IMAP e il successivo
-APPROVED_POLL_INTERVAL = 30   # secondi tra un controllo bozze approvate e il successivo
-IMAP_TIMEOUT           = 30   # timeout connessione IMAP in secondi
+IMAP_POLL_INTERVAL     = 60
+APPROVED_POLL_INTERVAL = 30
+IMAP_TIMEOUT           = 30
 
 anthropic_client = Anthropic()
 
 
 # ─────────────────────────────────────────────
-# Helpers DB — lettura configurazioni email clienti
+# Bounce detection
+# ─────────────────────────────────────────────
+
+BOUNCE_SENDER_PREFIXES = (
+    "mailer-daemon@", "postmaster@", "noreply@", "no-reply@",
+    "do-not-reply@", "donotreply@", "mail-daemon@", "daemon@",
+    "auto-reply@", "auto_reply@", "bounce@", "bounces@",
+    "delivery@", "maildelivery@",
+)
+
+BOUNCE_SUBJECT_KEYWORDS = (
+    "delivery status notification", "undelivered mail",
+    "mail delivery failed", "mail delivery failure",
+    "returned mail", "failure notice", "non-delivery report",
+    "undeliverable", "auto:", "automatic reply",
+    "out of office", "fuori ufficio", "risposta automatica",
+)
+
+def is_bounce(sender_email: str, subject: str) -> bool:
+    sender  = sender_email.lower().strip()
+    subject = subject.lower().strip()
+    if any(sender.startswith(p) for p in BOUNCE_SENDER_PREFIXES):
+        return True
+    if any(kw in subject for kw in BOUNCE_SUBJECT_KEYWORDS):
+        return True
+    return False
+
+
+# ─────────────────────────────────────────────
+# Strip quoted text — anti-matriosca
+# ─────────────────────────────────────────────
+
+# Pattern ordinati per specificità: prima i più precisi
+_QUOTE_DELIMITERS = [
+    # Outlook / Thunderbird: "Da: ... Inviato: ..."
+    re.compile(r"\n\s*Da:\s.+?\n\s*Inviato:\s.+?\n",        re.IGNORECASE | re.DOTALL),
+    re.compile(r"\n\s*From:\s.+?\n\s*Sent:\s.+?\n",         re.IGNORECASE | re.DOTALL),
+    # Gmail italiano: "Il giorno X, Y ha scritto:"
+    re.compile(r"\n\s*Il giorno .+? ha scritto:\s*\n",       re.IGNORECASE | re.DOTALL),
+    # Gmail inglese: "On X, Y wrote:"
+    re.compile(r"\n\s*On .+? wrote:\s*\n",                   re.IGNORECASE | re.DOTALL),
+    # Separatori "---Original Message---"
+    re.compile(r"\n[-_]{3,}.*?(Original Message|Messaggio originale|Forwarded).*?\n",
+               re.IGNORECASE),
+    # Linee che iniziano con ">" (tutti i client)
+    re.compile(r"(\n>[^\n]*)+",                              re.MULTILINE),
+]
+
+def strip_quoted_text(body: str) -> tuple[str, str, bool]:
+    """
+    Estrae SOLO il primo livello di quoted text.
+    Restituisce (corpo_pulito, quoted_primo_livello, nested_detected).
+
+    nested_detected=True significa che nel quoted c'era a sua volta del quoted
+    annidato (matriosca) — lo segnaliamo con tag [NESTED] e flag nel DB.
+    """
+    if not body:
+        return "", "", False
+
+    # Trova il punto più in alto in cui inizia il quoted
+    earliest_pos = len(body)
+    for pattern in _QUOTE_DELIMITERS:
+        m = pattern.search(body)
+        if m and m.start() < earliest_pos:
+            earliest_pos = m.start()
+
+    if earliest_pos == len(body):
+        # Nessun quoted trovato
+        return body.strip(), "", False
+
+    clean  = body[:earliest_pos].strip()
+    quoted = body[earliest_pos:].strip()
+
+    # Controlla se il quoted contiene a sua volta del quoted (matriosca)
+    nested = False
+    for pattern in _QUOTE_DELIMITERS:
+        if pattern.search(quoted):
+            nested = True
+            break
+
+    if nested:
+        # Strip del secondo livello — teniamo solo il messaggio immediatamente precedente
+        inner_earliest = len(quoted)
+        for pattern in _QUOTE_DELIMITERS:
+            m = pattern.search(quoted)
+            if m and m.start() < inner_earliest:
+                inner_earliest = m.start()
+
+        if inner_earliest < len(quoted):
+            quoted = quoted[:inner_earliest].strip() + "\n[NESTED: messaggi precedenti disponibili nel DB]"
+
+    return clean, quoted, nested
+
+
+# ─────────────────────────────────────────────
+# Rilevamento lingua
+# ─────────────────────────────────────────────
+
+def detect_email_language(text: str) -> str:
+    if not text or len(text.strip()) < 20:
+        return "unknown"
+    try:
+        from langdetect import detect
+        return detect(text)
+    except Exception:
+        return "unknown"
+
+
+# ─────────────────────────────────────────────
+# Generazione Message-ID
+# ─────────────────────────────────────────────
+
+def generate_message_id(smtp_user: str) -> str:
+    """
+    Genera un Message-ID univoco nel formato RFC 5322.
+    Es: <uuid@dominio>
+    """
+    domain  = smtp_user.split("@")[-1] if "@" in smtp_user else "polpo.ai"
+    msg_id  = f"<{uuid.uuid4().hex}@{domain}>"
+    return msg_id
+
+
+# ─────────────────────────────────────────────
+# Helpers DB
 # ─────────────────────────────────────────────
 
 def get_active_clients_with_email() -> list[dict]:
-    """
-    Ritorna tutti i clienti attivi che hanno le credenziali IMAP configurate.
-
-    Campi attesi nella tabella 'clients' (da aggiungere con migration):
-        imap_host, imap_port, imap_user, imap_password
-        smtp_host, smtp_port, smtp_user, smtp_password
-        imap_last_uid  (int, default 0) — UID ultima email processata
-    """
-    db = get_db()
     result = (
-        db.table("clients")
+        get_db().table("clients")
         .select("id, name, imap_host, imap_port, imap_user, imap_password, "
-                "smtp_host, smtp_port, smtp_user, smtp_password, imap_last_uid")
+                "smtp_host, smtp_port, smtp_user, smtp_password, imap_last_uid, language")
         .eq("active", True)
         .not_.is_("imap_host", "null")
         .execute()
@@ -86,21 +199,14 @@ def get_active_clients_with_email() -> list[dict]:
 
 
 def update_last_uid(client_id: str, uid: int) -> None:
-    """Aggiorna l'ultimo UID processato per evitare di riprocessare la stessa email."""
-    db = get_db()
-    db.table("clients").update({"imap_last_uid": uid}).eq("id", client_id).execute()
+    get_db().table("clients").update({"imap_last_uid": uid}).eq("id", client_id).execute()
 
 
 def get_approved_drafts() -> list[dict]:
-    """
-    Recupera tutte le bozze approvate non ancora inviate, con i dati dell'email originale
-    e le credenziali SMTP del cliente.
-    """
-    db = get_db()
     result = (
-        db.table("draft_responses")
+        get_db().table("draft_responses")
         .select("id, client_id, subject, body, email_id, telegram_message_id, "
-                "emails(sender_email, sender_name, subject), "
+                "emails(sender_email, sender_name, subject, message_id), "
                 "clients(smtp_host, smtp_port, smtp_user, smtp_password, name, telegram_chat_id)")
         .eq("status", "approved")
         .execute()
@@ -108,22 +214,83 @@ def get_approved_drafts() -> list[dict]:
     return result.data or []
 
 
-def mark_draft_sent(draft_id: str) -> None:
-    """Segna la bozza come inviata con timestamp."""
-    db = get_db()
-    db.table("draft_responses").update({
-        "status":  "sent",
-        "sent_at": datetime.now(timezone.utc).isoformat(),
+def mark_draft_sent(draft_id: str, sent_message_id: str) -> None:
+    get_db().table("draft_responses").update({
+        "status":          "sent",
+        "sent_at":         datetime.now(timezone.utc).isoformat(),
+        "sent_message_id": sent_message_id,
     }).eq("id", draft_id).execute()
 
 
 def mark_draft_failed(draft_id: str, error: str) -> None:
-    """Segna la bozza come fallita con messaggio di errore."""
-    db = get_db()
-    db.table("draft_responses").update({
+    get_db().table("draft_responses").update({
         "status":     "send_failed",
         "send_error": error[:500],
     }).eq("id", draft_id).execute()
+
+
+def save_email_enrichments(
+    email_id: str,
+    message_id: str = "",
+    in_reply_to: str = "",
+    references_ids: list = None,
+    quoted_text: str = "",
+    quoted_nested: bool = False,
+    detected_language: str = "",
+    thread_topic: str = "",
+) -> None:
+    """Aggiorna le colonne di arricchimento su un record email esistente."""
+    try:
+        get_db().table("emails").update({
+            "message_id":        message_id,
+            "in_reply_to":       in_reply_to,
+            "references_ids":    references_ids or [],
+            "quoted_text":       quoted_text,
+            "quoted_nested":     quoted_nested,
+            "detected_language": detected_language,
+            "thread_topic":      thread_topic,
+        }).eq("id", email_id).execute()
+    except Exception as e:
+        logger.error("worker | Errore salvataggio enrichments email_id=%s: %s", email_id, e)
+
+
+def save_outbound_email(
+    client_id: str,
+    draft_id: str,
+    sent_message_id: str,
+    in_reply_to: str,
+    references_ids: list,
+    sender_email: str,
+    sender_name: str,
+    recipient_email: str,
+    subject: str,
+    body: str,
+) -> None:
+    """
+    Crea un record nella tabella emails per ogni email inviata (direction='outbound').
+    Permette la ricostruzione completa del thread via query ricorsiva.
+    """
+    try:
+        get_db().table("emails").insert({
+            "client_id":      client_id,
+            "direction":      "outbound",
+            "message_id":     sent_message_id,
+            "in_reply_to":    in_reply_to,
+            "references_ids": references_ids,
+            "sender_email":   sender_email,
+            "sender_name":    sender_name,
+            "subject":        subject,
+            "body":           body,
+            "intent":         "outbound",
+            "priority":       0,
+            "classified_by":  "outbound",
+            "contact_type":   "bot",
+            "confidence":     1.0,
+            "summary":        f"Email inviata in risposta a {recipient_email}",
+        }).execute()
+        logger.info("worker | Salvata email outbound message_id=%s", sent_message_id)
+    except Exception as e:
+        logger.error("worker | Errore salvataggio outbound email: %s", e)
 
 
 # ─────────────────────────────────────────────
@@ -132,12 +299,10 @@ def mark_draft_failed(draft_id: str, error: str) -> None:
 
 async def fetch_new_emails_imap(client: dict) -> list[dict]:
     """
-    Si connette via IMAP al provider del cliente e recupera le email
-    con UID maggiore dell'ultimo processato.
-
-    Ritorna lista di dict: uid, sender_email, sender_name, subject, body
+    Recupera le nuove email IMAP con UID > last_uid.
+    Esegue strip anti-matriosca, rilevamento lingua, parsing header thread.
     """
-    client_id = client["id"]
+    client_id       = client["id"]
     last_uid_global = int(client.get("imap_last_uid") or 0)
 
     imap = aioimaplib.IMAP4_SSL(
@@ -147,46 +312,31 @@ async def fetch_new_emails_imap(client: dict) -> list[dict]:
     )
 
     try:
-        logger.info("worker.imap | [%s] Connessione a %s:%s...", client["name"], client["imap_host"], client.get("imap_port", 993))
         await imap.wait_hello_from_server()
-        # Gmail app passwords are stored with spaces (e.g. "xxxx xxxx xxxx xxxx") — strip them
         imap_password = (client["imap_password"] or "").replace(" ", "")
         await imap.login(client["imap_user"], imap_password)
         logger.info("worker.imap | [%s] Login effettuato", client["name"])
-        
-        # Lista cartelle da controllare
-        # Solo INBOX per ora — la cartella Spam di Gmail richiede gestione separata
-        folders = ["INBOX"]
-        
+
         emails_found = []
 
-        for folder in folders:
-            # Per INBOX usa imap_last_uid dal DB; per Spam parte sempre da 0
-            last_uid = last_uid_global if folder == "INBOX" else 0
-
-            logger.info("worker.imap | [%s] Seleziono %s (last_uid seen: %d)...", client["name"], folder, last_uid)
+        for folder in ["INBOX"]:
+            last_uid   = last_uid_global if folder == "INBOX" else 0
             select_res = await imap.select(folder)
-            if select_res[0] != 'OK':
+            if select_res[0] != "OK":
                 continue
 
-            # Recupera tutti i numeri di sequenza e scansiona dalla fine
-            # fermandosi appena troviamo UID <= last_uid (già processati)
-            import re as _re
-            _, data = await imap.search("ALL")
-            seq_list = [s for s in data[0].decode().split() if s.strip()]
-
+            _, data   = await imap.search("ALL")
+            seq_list  = [s for s in data[0].decode().split() if s.strip()]
             if not seq_list:
-                logger.info("worker.imap | [%s] Nessuna email in %s", client["name"], folder)
                 continue
 
-            # Scorri dalla più recente, fermati al primo già processato
             new_seqs = []
             for seq_str in reversed(seq_list):
                 _, hdr_data = await imap.fetch(seq_str, "(UID)")
                 uid = None
                 for part in hdr_data:
                     if isinstance(part, (bytes, bytearray)):
-                        m = _re.search(rb"UID (\d+)", bytes(part))
+                        m = re.search(rb"UID (\d+)", bytes(part))
                         if m:
                             uid = int(m.group(1))
                             break
@@ -194,18 +344,16 @@ async def fetch_new_emails_imap(client: dict) -> list[dict]:
                     break
                 new_seqs.append((seq_str, uid))
 
-            new_seqs = list(reversed(new_seqs))  # ordina dal più vecchio
+            new_seqs = list(reversed(new_seqs))
             if not new_seqs:
-                logger.info("worker.imap | [%s] Nessuna nuova email in %s (last_uid=%d)", client["name"], folder, last_uid)
                 continue
 
-            logger.info("worker.imap | [%s] %d nuove email in %s", client["name"], len(new_seqs), folder)
+            logger.info("worker.imap | [%s] %d nuove email in %s",
+                        client["name"], len(new_seqs), folder)
 
             for seq_str, uid in new_seqs:
-                # Scarica il corpo completo
                 _, msg_data = await imap.fetch(seq_str, "(RFC822)")
                 if not msg_data:
-                    logger.warning("worker.imap | [%s] Nessun dato per UID %d", client["name"], uid)
                     continue
 
                 raw_bytes = None
@@ -221,73 +369,105 @@ async def fetch_new_emails_imap(client: dict) -> list[dict]:
                         if raw_bytes:
                             break
 
-                logger.info("worker.imap | [%s] Trovata NUOVA email (UID: %d)", client["name"], uid)
                 if not raw_bytes:
-                    logger.warning("worker.imap | [%s] Nessun corpo RFC822 per UID %d", client["name"], uid)
                     continue
 
-                logger.info("worker.imap | [%s] Parsing email UID: %d", client["name"], uid)
-
-                msg = email_lib.message_from_bytes(raw_bytes, policy=email_lib.policy.default)
-
-                # Mittente
-                from_raw               = msg.get("From", "")
+                msg          = email_lib.message_from_bytes(raw_bytes, policy=email_lib.policy.default)
+                from_raw     = msg.get("From", "")
                 sender_name, sender_email = email_lib.utils.parseaddr(from_raw)
-                sender_email           = sender_email.lower().strip()
-                sender_name            = sender_name.strip() or sender_email
-                message_id             = msg.get("Message-ID", "")
+                sender_email = sender_email.lower().strip()
+                sender_name  = sender_name.strip() or sender_email
+
+                # Header threading RFC822
+                message_id   = (msg.get("Message-ID", "") or "").strip()
+                in_reply_to  = (msg.get("In-Reply-To", "") or "").strip()
+                references   = (msg.get("References", "") or "").strip()
+                # References è una lista di message_id separati da spazi/newline
+                references_ids = [r.strip() for r in references.split() if r.strip()]
 
                 subject = msg.get("Subject", "(nessun oggetto)").strip()
 
-                # Body — preferisce plain text
-                body = ""
+                # Bounce detection
+                if is_bounce(sender_email, subject):
+                    logger.info("worker.imap | [%s] Skip UID %d (bounce: %s)",
+                                client["name"], uid, sender_email)
+                    emails_found.append({
+                        "uid": uid, "sender_email": sender_email,
+                        "sender_name": sender_name, "subject": subject,
+                        "body": "", "message_id": message_id,
+                        "folder": folder, "_skip": True,
+                    })
+                    continue
+
+                # Estrazione corpo + allegati
+                body            = ""
+                raw_attachments = []
+
                 if msg.is_multipart():
                     for part in msg.walk():
                         ct = part.get_content_type()
                         cd = str(part.get("Content-Disposition", ""))
-                        if ct == "text/plain" and "attachment" not in cd:
-                            body = part.get_content()
-                            break
+                        fn = part.get_filename()
+
+                        if fn or "attachment" in cd:
+                            try:
+                                att_data = part.get_payload(decode=True)
+                                if att_data:
+                                    raw_attachments.append({
+                                        "filename":  fn or "allegato",
+                                        "mime_type": ct,
+                                        "data":      att_data,
+                                    })
+                            except Exception as att_e:
+                                logger.warning("worker.imap | Errore allegato '%s': %s", fn, att_e)
+                            continue
+
+                        if ct == "text/plain" and not body:
+                            body = part.get_content() or ""
                     if not body:
                         for part in msg.walk():
                             if part.get_content_type() == "text/html":
-                                body = part.get_content()
+                                body = part.get_content() or ""
                                 break
                 else:
-                    body = msg.get_content()
+                    body = msg.get_content() or ""
 
-                body = (body or "").strip()
+                body = body.strip()
                 if len(body) > 30000:
-                    logger.warning("worker.imap | [%s] Email UID %d troncata da %d a 30000 caratteri", client["name"], uid, len(body))
-                    body = body[:30000] + "\n\n[...Testo troncato: troppo lungo...]"
+                    body = body[:30000] + "\n\n[...Testo troncato...]"
 
-                # Salta email vuote o bounce di sistema, ma traccia l'UID
-                if not body or sender_email.startswith("mailer-daemon@") or sender_email.startswith("postmaster@"):
-                    logger.info("worker.imap | [%s] Skip UID %d (mailer-daemon/postmaster/vuota)", client["name"], uid)
+                if not body and not raw_attachments:
                     emails_found.append({
-                        "uid":          uid,
-                        "sender_email": sender_email,
-                        "sender_name":  sender_name,
-                        "subject":      subject,
-                        "body":         "",
-                        "message_id":   message_id,
-                        "folder":       folder,
-                        "_skip":        True,
+                        "uid": uid, "sender_email": sender_email,
+                        "sender_name": sender_name, "subject": subject,
+                        "body": "", "message_id": message_id,
+                        "folder": folder, "_skip": True,
                     })
                     continue
 
+                # Strip anti-matriosca
+                clean_body, quoted_text, quoted_nested = strip_quoted_text(body)
+
+                # Lingua
+                detected_language = detect_email_language(clean_body or subject)
+
                 emails_found.append({
-                    "uid":          uid,
-                    "sender_email": sender_email,
-                    "sender_name":  sender_name,
-                    "subject":      subject,
-                    "body":         body,
-                    "message_id":   message_id,
-                    "folder":       folder
+                    "uid":               uid,
+                    "sender_email":      sender_email,
+                    "sender_name":       sender_name,
+                    "subject":           subject,
+                    "body":              clean_body,
+                    "quoted_text":       quoted_text,
+                    "quoted_nested":     quoted_nested,
+                    "raw_attachments":   raw_attachments,
+                    "message_id":        message_id,
+                    "in_reply_to":       in_reply_to,
+                    "references_ids":    references_ids,
+                    "folder":            folder,
+                    "detected_language": detected_language,
                 })
 
         await imap.logout()
-        # Ordina per UID totale (opzionale)
         emails_found.sort(key=lambda x: x["uid"])
         return emails_found
 
@@ -305,72 +485,172 @@ async def fetch_new_emails_imap(client: dict) -> list[dict]:
 # Pipeline processamento email
 # ─────────────────────────────────────────────
 
+def _update_draft_gen_status(email_id: str, status: str) -> None:
+    """Aggiorna draft_generation_status sulla tabella emails."""
+    try:
+        get_db().table("emails").update({
+            "draft_generation_status": status
+        }).eq("id", email_id).execute()
+    except Exception as e:
+        logger.warning("worker | _update_draft_gen_status failed: %s", e)
+
+
+async def _alert_draft_failed(client_id: str, email_id: str, error: str) -> None:
+    """Invia alert Telegram quando la generazione bozza fallisce."""
+    try:
+        db      = get_db()
+        client  = db.table("clients").select("telegram_chat_id, name").eq("id", client_id).execute()
+        if not client.data:
+            return
+        chat_id = client.data[0].get("telegram_chat_id")
+        name    = client.data[0].get("name", client_id)
+        if not chat_id:
+            return
+        email   = db.table("emails").select("subject, sender_email").eq("id", email_id).execute()
+        subject = email.data[0].get("subject", "—") if email.data else "—"
+        sender  = email.data[0].get("sender_email", "—") if email.data else "—"
+        msg = (
+            f"⚠️ *Generazione bozza fallita* — {name}\n\n"
+            f"Da: `{sender}`\n"
+            f"Oggetto: {subject}\n"
+            f"Errore: `{error[:200]}`\n\n"
+            f"Email ID: `{email_id}`\n"
+            f"Richiede gestione manuale."
+        )
+        await telegram_bot.send_alert(chat_id, msg)
+    except Exception as e:
+        logger.error("worker | _alert_draft_failed: %s", e)
+
+
 async def process_email(client_id: str, email_data: dict) -> None:
     """
-    Replica il flusso di elaborazione:
-      1. Classifica l'email (Sync -> via to_thread)
-      2. Genera la bozza (Sync -> via to_thread)
-      3. Notifica Telegram (Async -> await)
+    Flusso completo:
+      1. Classificazione Haiku con contesto completo (corpo + thread)
+      2. Salva enrichments nel DB (message_id, in_reply_to, quoted_text, lingua, thread_topic)
+      3. Processa allegati con Sonnet (estrai testo, salva nel DB)
+      4. Genera bozza con Sonnet
+      5. Notifica Telegram
     """
     client_name = email_data.get("_client_name", client_id)
-    logger.info("worker.process | [%s] Elaboro email da %s: %s", 
+    logger.info("worker.process | [%s] Elaboro email da %s: %s",
                 client_name, email_data.get("sender_email"), email_data.get("subject"))
 
-    anthropic_client = Anthropic()
+    llm_client      = Anthropic()
+    raw_attachments = email_data.get("raw_attachments", [])
 
-    # 1. Classificazione (Blocking -> Thread)
+    # Corpo per il classifier — se vuoto ma con allegati, segnalalo
+    body_for_classifier = email_data["body"]
+    if not body_for_classifier.strip() and raw_attachments:
+        att_names           = ", ".join(a["filename"] for a in raw_attachments)
+        body_for_classifier = f"[Email senza testo — allegati presenti: {att_names}]"
+
+    # 1. Classificazione — passa il quoted_text direttamente (sempre se presente)
     try:
-        from classifier import InboundMessage, classify_message
         msg = InboundMessage(
             sender_email=email_data["sender_email"],
             sender_name=email_data["sender_name"],
             subject=email_data["subject"],
-            body=email_data["body"]
+            body=body_for_classifier,
+            detected_language=email_data.get("detected_language", "unknown"),
+            in_reply_to=email_data.get("in_reply_to", ""),
         )
-        
+
         result = await asyncio.to_thread(
-            classify_message, 
-            msg=msg, 
-            client_id=client_id, 
-            llm_client=anthropic_client, 
-            use_real_db=True, 
-            save_to_db=True
+            classify_message,
+            msg=msg,
+            client_id=client_id,
+            llm_client=llm_client,
+            use_real_db=True,
+            save_to_db=True,
+            quoted_text=email_data.get("quoted_text", ""),
         )
     except Exception as e:
-        logger.error("worker.process | [%s] Errore classificazione per email da %s: %s", 
-                     client_name, email_data["sender_email"], e)
+        logger.error("worker.process | [%s] Errore classificazione: %s", client_name, e)
         return
 
     if not result.db_ids:
-        logger.error("worker.process | [%s] Salvataggio DB fallito dopo classificazione", client_name)
+        logger.error("worker.process | [%s] Salvataggio DB fallito", client_name)
         return
 
     email_id = result.db_ids["email_id"]
-    logger.info("worker.process | [%s] Classificata → intent=%s priority=%d by=%s (email_id: %s)",
-                client_name, result.intent, result.priority, result.classified_by, email_id)
+    logger.info("worker.process | [%s] Classificata → intent=%s thread_topic=%s priority=%d (email_id=%s)",
+                client_name, result.intent, result.thread_topic or "—",
+                result.priority, email_id)
 
-    # Priorità 0: email automatiche o cortesia → segna no_reply, non generare bozza
-    if result.priority == 0:
-        logger.info("worker.process | [%s] Priorità 0 (%s) — nessuna risposta generata",
+    # 2. Salva enrichments nel DB
+    await asyncio.to_thread(
+        save_email_enrichments,
+        email_id=email_id,
+        message_id=email_data.get("message_id", ""),
+        in_reply_to=email_data.get("in_reply_to", ""),
+        references_ids=email_data.get("references_ids", []),
+        quoted_text=email_data.get("quoted_text", ""),
+        quoted_nested=email_data.get("quoted_nested", False),
+        detected_language=email_data.get("detected_language", ""),
+        thread_topic=result.thread_topic or "",
+    )
+
+    # 3. Allegati — screening Haiku + estrazione Sonnet
+    if raw_attachments and result.priority > 0 and result.intent != "spam":
+        logger.info("worker.process | [%s] Processo %d allegato/i...",
+                    client_name, len(raw_attachments))
+        att_result = await asyncio.to_thread(
+            process_email_attachments,
+            email_id,
+            raw_attachments,
+            llm_client,
+            email_data.get("subject", ""),
+            email_data.get("body", ""),
+        )
+
+        # Allegati grandi → chiedi conferma su Telegram
+        for pending in att_result.get("to_ask", []):
+            try:
+                await telegram_bot.ask_extract_attachment(
+                    client_id=client_id,
+                    email_id=email_id,
+                    filename=pending["filename"],
+                    size_mb=round(pending["size_bytes"] / 1024 / 1024, 1),
+                    reason=pending["reason"],
+                )
+            except Exception as e:
+                logger.warning("worker.process | [%s] ask_extract_attachment fallito: %s", client_name, e)
+
+        # Allegati medi estratti → notifica su Telegram (non blocca)
+        for notified in att_result.get("notified", []):
+            logger.info("worker.process | [%s] Allegato grande estratto: %s",
+                        client_name, notified["filename"])
+
+    # Priorità 0 o spam → nessuna risposta
+    if result.priority == 0 or result.intent == "spam":
+        logger.info("worker.process | [%s] Priorità 0 / spam (%s) — nessuna risposta",
                     client_name, result.intent)
         mark_email_no_reply(email_id, result.summary)
+        _update_draft_gen_status(email_id, "skipped")
         return
 
-    # Spam: non generare bozza
-    if result.intent == "spam":
-        logger.info("worker.process | [%s] Spam ignorato", client_name)
+    # 4. Genera bozza con Sonnet
+    draft = None
+    try:
+        draft = await asyncio.to_thread(generate_response_draft, email_id, llm_client)
+    except Exception as e:
+        err = str(e)
+        logger.error("worker.process | [%s] Eccezione generazione bozza: %s", client_name, err)
+        mark_draft_generation_failed(email_id, err)
+        await _alert_draft_failed(client_id, email_id, err)
         return
 
-    # Genera bozza con Claude Sonnet (Blocking -> Thread)
-    draft = await asyncio.to_thread(generate_response_draft, email_id, anthropic_client)
     if not draft:
-        logger.error("worker.process | [%s] Generazione bozza fallita per email %s",
-                     client_name, email_id)
+        err = "generate_response_draft ha restituito None"
+        logger.error("worker.process | [%s] %s (email %s)", client_name, err, email_id)
+        mark_draft_generation_failed(email_id, err)
+        await _alert_draft_failed(client_id, email_id, err)
         return
 
+    _update_draft_gen_status(email_id, "done")
     logger.info("worker.process | [%s] Bozza pronta → draft_id=%s", client_name, draft.draft_id)
 
-    # Notifica Telegram per email importanti (Priority 2 e 3)
+    # 5. Notifica Telegram per email importanti (Priority 2 e 3)
     if result.priority >= 2 and draft.draft_id:
         try:
             await telegram_bot.notify_draft(draft.draft_id)
@@ -384,34 +664,43 @@ async def process_email(client_id: str, email_data: dict) -> None:
 
 async def send_email_smtp(draft: dict) -> None:
     """
-    Invia una bozza approvata tramite SMTP del cliente proprietario.
-    Aggiorna lo status a 'sent' o 'send_failed'.
+    Invia una bozza approvata via SMTP.
+    - Genera un Message-ID univoco prima dell'invio
+    - Salva un record outbound nella tabella emails per il threading
+    - Aggiorna draft_responses con sent_message_id e status='sent'
     """
     draft_id    = draft["id"]
+    client_id   = draft["client_id"]
     client_smtp = draft.get("clients") or {}
     email_orig  = draft.get("emails") or {}
 
-    to_address = email_orig.get("sender_email", "")
-    to_name    = email_orig.get("sender_name", "")
-    subject    = draft.get("subject", "")
-    body       = draft.get("body", "")
-    from_name  = client_smtp.get("name", "")
-    from_email = client_smtp.get("smtp_user", "")
+    to_address   = email_orig.get("sender_email", "")
+    to_name      = email_orig.get("sender_name", "")
+    subject      = draft.get("subject", "")
+    body         = draft.get("body", "")
+    from_name    = client_smtp.get("name", "")
+    from_email   = client_smtp.get("smtp_user", "")
 
     if not to_address or not from_email:
-        logger.error("worker.smtp | draft %s — dati mancanti (to=%s from=%s)",
-                     draft_id, to_address, from_email)
+        logger.error("worker.smtp | draft %s — dati mancanti", draft_id)
         mark_draft_failed(draft_id, "Dati mittente/destinatario mancanti")
         return
 
-    # Costruisci messaggio MIME
+    # Message-ID generato da noi → controllo totale, salviamo subito
+    sent_message_id       = generate_message_id(from_email)
+    original_message_id   = email_orig.get("message_id", "")
+
+    # References: aggiungi message_id originale alla catena
+    references_ids = []
+    if original_message_id:
+        references_ids = [original_message_id]
+
     mime_msg             = MIMEMultipart("alternative")
     mime_msg["Subject"]  = subject
     mime_msg["From"]     = f"{from_name} <{from_email}>" if from_name else from_email
     mime_msg["To"]       = f"{to_name} <{to_address}>" if to_name else to_address
+    mime_msg["Message-ID"] = sent_message_id
 
-    # Thread header per risposta nella stessa conversazione
-    original_message_id = email_orig.get("message_id", "")
     if original_message_id:
         mime_msg["In-Reply-To"] = original_message_id
         mime_msg["References"]  = original_message_id
@@ -428,10 +717,27 @@ async def send_email_smtp(draft: dict) -> None:
             start_tls=True,
             timeout=30,
         )
-        mark_draft_sent(draft_id)
-        logger.info("worker.smtp | ✓ Inviata → draft=%s a <%s>", draft_id, to_address)
 
-        # Aggiorna la card Telegram con stato finale "📨 Inviata!" (solo se la card esiste)
+        # Aggiorna draft con sent_message_id
+        mark_draft_sent(draft_id, sent_message_id)
+        logger.info("worker.smtp | ✓ Inviata → draft=%s a <%s> msg_id=%s",
+                    draft_id, to_address, sent_message_id)
+
+        # Salva email outbound nel DB per threading completo
+        save_outbound_email(
+            client_id=client_id,
+            draft_id=draft_id,
+            sent_message_id=sent_message_id,
+            in_reply_to=original_message_id,
+            references_ids=references_ids,
+            sender_email=from_email,
+            sender_name=from_name,
+            recipient_email=to_address,
+            subject=subject,
+            body=body,
+        )
+
+        # Aggiorna card Telegram
         tg_msg_id  = draft.get("telegram_message_id")
         tg_chat_id = client_smtp.get("telegram_chat_id")
         if tg_msg_id and tg_chat_id:
@@ -442,7 +748,6 @@ async def send_email_smtp(draft: dict) -> None:
         logger.error("worker.smtp | ✗ Fallita → draft=%s: %s", draft_id, err)
         mark_draft_failed(draft_id, err)
 
-        # Aggiorna la card Telegram segnalando il fallimento
         tg_msg_id  = draft.get("telegram_message_id")
         tg_chat_id = client_smtp.get("telegram_chat_id")
         if tg_msg_id and tg_chat_id:
@@ -454,35 +759,22 @@ async def send_email_smtp(draft: dict) -> None:
 # ─────────────────────────────────────────────
 
 async def imap_polling_loop() -> None:
-    """
-    Ogni IMAP_POLL_INTERVAL secondi controlla le nuove email
-    per tutti i clienti attivi con IMAP configurato.
-    """
     logger.info("worker | ▶ IMAP polling loop avviato (ogni %ds)", IMAP_POLL_INTERVAL)
-    # loop = asyncio.get_event_loop() # No longer needed as process_email is async
 
     while True:
         try:
             clients = get_active_clients_with_email()
-            logger.debug("worker.imap | Controllo %d clienti", len(clients))
-
             for client in clients:
                 client_id   = client["id"]
                 client_name = client.get("name", client_id)
-
                 try:
                     new_emails = await fetch_new_emails_imap(client)
                     if not new_emails:
                         continue
 
-                    logger.info("worker.imap | [%s] %d nuove email", client_name, len(new_emails))
-
                     max_uid = int(client.get("imap_last_uid") or 0)
-
                     for email_data in new_emails:
                         email_data["_client_name"] = client_name
-                        # Email marcate _skip (mailer-daemon, postmaster, vuote):
-                        # non processare ma aggiorna max_uid per non riprocessarle
                         if email_data.get("_skip"):
                             max_uid = max(max_uid, email_data["uid"])
                             continue
@@ -490,10 +782,9 @@ async def imap_polling_loop() -> None:
                             await process_email(client_id, email_data)
                             max_uid = max(max_uid, email_data["uid"])
                         except Exception as inner_e:
-                            logger.error("worker.imap | [%s] Errore processamento email UID %s: %s",
+                            logger.error("worker.imap | [%s] Errore UID %s: %s",
                                          client_name, email_data.get("uid"), inner_e)
 
-                    # Aggiorna UID solo dopo aver processato tutto il batch
                     if max_uid > int(client.get("imap_last_uid") or 0):
                         update_last_uid(client_id, max_uid)
 
@@ -511,10 +802,6 @@ async def imap_polling_loop() -> None:
 # ─────────────────────────────────────────────
 
 async def approved_watcher_loop() -> None:
-    """
-    Ogni APPROVED_POLL_INTERVAL secondi cerca le bozze approvate
-    e le invia via SMTP in parallelo.
-    """
     logger.info("worker | ▶ Approved watcher avviato (ogni %ds)", APPROVED_POLL_INTERVAL)
 
     while True:
@@ -533,39 +820,30 @@ async def approved_watcher_loop() -> None:
 
 
 # ─────────────────────────────────────────────
-# Entry point standalone
+# Entry point
 # ─────────────────────────────────────────────
 
 async def start_worker() -> None:
-    """
-    Avvia entrambi i loop in parallelo.
-    Può essere chiamato da main.py con asyncio.create_task()
-    oppure direttamente con: python email_worker.py
-    """
     logger.info("=" * 55)
-    logger.info("  Polpo AI — Email Worker")
+    logger.info("  Polpo AI — Email Worker v3")
     logger.info("  IMAP polling ogni %ds", IMAP_POLL_INTERVAL)
     logger.info("  Approved watcher ogni %ds", APPROVED_POLL_INTERVAL)
     logger.info("=" * 55)
-
-    await asyncio.gather(
-        imap_polling_loop(),
-        approved_watcher_loop(),
-    )
+    await asyncio.gather(imap_polling_loop(), approved_watcher_loop())
 
 
 if __name__ == "__main__":
     import fcntl
     import sys
-    
-    lock_file = open("/tmp/polpo_email_worker.lock", "w")
+
+    lock_path = os.getenv("WORKER_LOCK_FILE", "/tmp/polpo_email_worker.lock")
+    lock_file = open(lock_path, "w")
     try:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except IOError:
         logger.error("❌ Un'istanza di email_worker.py è già in esecuzione! Exit.")
-        print("Worker is already running. Exiting.")
         sys.exit(1)
-        
+
     try:
         asyncio.run(start_worker())
     finally:

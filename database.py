@@ -1,5 +1,5 @@
 """
-database.py — Layer Supabase per Polpo AI Email Bot (v2 Multi-Tenant)
+database.py — Layer Supabase per Polpo AI Email Bot (v3 Multi-Tenant)
 
 Ogni operazione richiede client_id per isolare i dati tra clienti.
 
@@ -115,52 +115,79 @@ def _normalize_subject(subject: str) -> str:
     return re.sub(r"^(re|fwd|r|fw|inoltro):\s*", "", subject.strip(), flags=re.IGNORECASE).strip()
 
 
-def find_or_create_conversation(client_id: str, contact_id: str, subject: str) -> dict:
-    """Trova conversazione esistente per thread oppure ne crea una nuova."""
+def find_or_create_conversation(
+    client_id:   str,
+    contact_id:  str,
+    subject:     str,
+    in_reply_to: str = "",
+) -> dict:
+    """
+    Trova conversazione esistente o ne crea una nuova.
+
+    Strategia di raggruppamento (in ordine di priorità):
+
+    1. RFC822 in_reply_to → cerca l'email con quel message_id e usa
+       la sua conversation_id. Questo è il criterio corretto per i thread
+       email — garantisce che "Re: Preventivo" di marzo non si mescoli
+       con "Re: Preventivo" di gennaio.
+
+    2. Nessun in_reply_to → nuova email indipendente → nuova conversazione.
+       Non usiamo più il subject per raggruppare: troppo ambiguo.
+       Il subject viene salvato solo come etichetta leggibile.
+    """
     db = get_client()
+
+    # Criterio 1: thread RFC822
+    if in_reply_to:
+        parent = (
+            db.table("emails")
+            .select("conversation_id")
+            .eq("client_id", client_id)
+            .eq("message_id", in_reply_to)
+            .limit(1)
+            .execute()
+        )
+        if parent.data and parent.data[0].get("conversation_id"):
+            conv_id = parent.data[0]["conversation_id"]
+            # Aggiorna contatori
+            conv = db.table("conversations").select("*").eq("id", conv_id).execute()
+            if conv.data:
+                c = conv.data[0]
+                db.table("conversations").update({
+                    "email_count":   c["email_count"] + 1,
+                    "last_email_at": datetime.now(timezone.utc).isoformat(),
+                }).eq("id", conv_id).execute()
+                c["email_count"] += 1
+                return c
+
+    # Criterio 2: nuova conversazione
     thread = _normalize_subject(subject)
-
-    existing = (
-        db.table("conversations")
-        .select("*")
-        .eq("client_id", client_id)
-        .eq("contact_id", contact_id)
-        .eq("subject_thread", thread)
-        .order("created_at", desc=True)
-        .limit(1)
-        .execute()
-    )
-
-    if existing.data:
-        conv = existing.data[0]
-        db.table("conversations").update({
-            "email_count":  conv["email_count"] + 1,
-            "last_email_at": datetime.now(timezone.utc).isoformat(),
-        }).eq("id", conv["id"]).execute()
-        conv["email_count"] += 1
-        return conv
-
     result = db.table("conversations").insert({
-        "client_id":     client_id,
-        "contact_id":    contact_id,
+        "client_id":      client_id,
+        "contact_id":     contact_id,
         "subject_thread": thread,
     }).execute()
 
     return result.data[0]
 
 
-def get_conversation_history(conversation_id: str, limit: int = 3) -> list[dict]:
-    """Ultime N email di una conversazione con classificazione."""
+def get_conversation_history(conversation_id: str, limit: int = 6) -> list[dict]:
+    """
+    Ultime N email di una conversazione (inbound + outbound), ordinate cronologicamente.
+    Include le email inviate dal bot (direction=outbound) per dare a Sonnet
+    il contesto completo dello scambio — non solo le domande ma anche le risposte date.
+    """
     db = get_client()
     result = (
         db.table("emails")
-        .select("id, received_at, subject, body, email_classifications(*)")
+        .select("id, received_at, subject, body, direction, email_classifications(intent, priority, summary)")
         .eq("conversation_id", conversation_id)
         .order("received_at", desc=True)
         .limit(limit)
         .execute()
     )
-    return result.data
+    # Restituisce in ordine cronologico (dal più vecchio) per il prompt
+    return list(reversed(result.data))
 
 
 # ─────────────────────────────────────────────
@@ -312,12 +339,28 @@ def mark_email_no_reply(email_id: str, summary: str = "") -> dict:
     return result.data[0] if result.data else {}
 
 
-def mark_draft_sent(draft_id: str) -> dict:
-    """Marca una bozza come inviata."""
+def mark_draft_generation_failed(email_id: str, error: str) -> None:
+    """
+    Registra il fallimento della generazione bozza su un'email.
+    Imposta draft_generation_status='failed' sulla tabella emails.
+    Il worker Telegram-alert viene triggerato separatamente.
+    """
+    try:
+        get_client().table("emails").update({
+            "draft_generation_status": "failed",
+            "draft_generation_error":  error[:500],
+        }).eq("id", email_id).execute()
+    except Exception as e:
+        logger.error("mark_draft_generation_failed | email_id=%s: %s", email_id, e)
+
+
+def mark_draft_sent(draft_id: str, sent_message_id: str = "") -> dict:
+    """Marca una bozza come inviata, salva il Message-ID SMTP generato."""
     db = get_client()
     result = db.table("draft_responses").update({
-        "status":  "sent",
-        "sent_at": datetime.now(timezone.utc).isoformat(),
+        "status":          "sent",
+        "sent_at":         datetime.now(timezone.utc).isoformat(),
+        "sent_message_id": sent_message_id,
     }).eq("id", draft_id).execute()
     return result.data[0]
 
@@ -370,18 +413,19 @@ def persist_classified_email(
     classified_by:   str,
     summary:         str,
     estimated_value: Optional[float] = None,
+    in_reply_to:     str = "",
 ) -> dict:
     """
     Pipeline salvataggio completa:
     1. Upsert contatto
-    2. Trova o crea conversazione
+    2. Trova o crea conversazione (via RFC822 in_reply_to se disponibile)
     3. Salva email
     4. Salva classificazione
     """
     contact = upsert_contact(client_id, sender_email, sender_name, contact_type)
     contact_id = contact["id"]
 
-    conversation = find_or_create_conversation(client_id, contact_id, subject)
+    conversation = find_or_create_conversation(client_id, contact_id, subject, in_reply_to)
     conversation_id = conversation["id"]
 
     email_record = save_email(
@@ -441,9 +485,9 @@ def get_approved_drafts() -> list[dict]:
     # Recuperiamo info sulla bozza, sull'email originale e sulle credenziali SMTP del cliente
     result = (
         db.table("draft_responses")
-        .select("id, client_id, subject, body, email_id, "
-                "emails(sender_email, sender_name, subject), " # Rimosso message_id
-                "clients(smtp_host, smtp_port, smtp_user, smtp_password, name)")
+        .select("id, client_id, subject, body, email_id, telegram_message_id, "
+                "emails(sender_email, sender_name, subject, message_id), "
+                "clients(smtp_host, smtp_port, smtp_user, smtp_password, name, telegram_chat_id)")
         .eq("status", "approved")
         .execute()
     )

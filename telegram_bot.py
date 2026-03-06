@@ -36,7 +36,9 @@ from database import (
     save_telegram_message_id,
     update_draft_body,
     get_client_id_by_telegram_chat_id,
+    get_client as get_db,
 )
+from attachment_reader import extract_pending_attachment
 from responder import refine_draft
 import query_tools
 from notifications import notify_missing_feature
@@ -148,6 +150,58 @@ async def update_card_failed(chat_id: str, message_id: int, draft: dict, error: 
     logger.error("update_card_failed | chat_id=%s msg_id=%s → errore: %s", chat_id, message_id, error[:80])
 
 
+
+async def send_alert(chat_id: str, text: str) -> None:
+    """Invia un messaggio di alert generico a un chat_id."""
+    await _tg_post("sendMessage", {
+        "chat_id":    chat_id,
+        "text":       text,
+        "parse_mode": "Markdown",
+    })
+
+
+async def ask_extract_attachment(
+    client_id: str,
+    email_id:  str,
+    filename:  str,
+    size_mb:   float,
+    reason:    str,
+) -> None:
+    """
+    Invia card Telegram per chiedere conferma prima di estrarre allegato >4MB.
+    """
+    db     = get_db()
+    result = db.table("clients").select("telegram_chat_id").eq("id", client_id).execute()
+    if not result.data:
+        return
+    chat_id = result.data[0].get("telegram_chat_id")
+    if not chat_id:
+        return
+
+    cost = round(size_mb * 0.25, 2)
+    msg  = (
+        "📎 *Allegato grande ricevuto*\n\n"
+        "File: `" + filename + "`\n"
+        "Dimensione: *" + str(size_mb) + " MB*\n"
+        "Contesto: " + reason + "\n\n"
+        "Vuoi che legga questo allegato? "
+        "Costera circa EUR " + str(cost) + "."
+    )
+    markup = {
+        "inline_keyboard": [[
+            {"text": "\u2705 Si, leggilo", "callback_data": "leggi_allegato:" + email_id + ":" + filename},
+            {"text": "\u274c No, salta",   "callback_data": "salta_allegato:" + email_id + ":" + filename},
+        ]]
+    }
+    await _tg_post("sendMessage", {
+        "chat_id":      chat_id,
+        "text":         msg,
+        "parse_mode":   "Markdown",
+        "reply_markup": markup,
+    })
+    logger.info("ask_extract_attachment | email=%s file=%s chat=%s", email_id[:8], filename, chat_id)
+
+
 # ─────────────────────────────────────────────
 # Gestione update in arrivo dal webhook
 # ─────────────────────────────────────────────
@@ -229,6 +283,40 @@ async def _handle_callback(cq: dict) -> None:
         await _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": "⏸ Rimandato", "show_alert": False})
         await _edit_message(chat_id, message_id, _format_message(draft) + "\n\n⏸ *Lasciato per dopo* — gestisci dalla dashboard.")
         logger.info("callback | draft_id=%s snooze, bottoni rimossi", draft_id[:8])
+
+    elif action == "leggi_allegato":
+        parts        = raw_data.split(":", 2)
+        email_id_att = parts[1] if len(parts) > 1 else ""
+        filename_att = parts[2] if len(parts) > 2 else ""
+        await _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": "⏳ Lettura in corso...", "show_alert": False})
+        await _edit_message(chat_id, message_id, "⏳ _Leggo allegato..._")
+        try:
+            import asyncio
+            anthropic_client = Anthropic()
+            att_text = await asyncio.to_thread(
+                extract_pending_attachment, email_id_att, filename_att, anthropic_client
+            )
+            if att_text:
+                preview = att_text[:600] + ("..." if len(att_text) > 600 else "")
+                await _tg_post("sendMessage", {
+                    "chat_id":    chat_id,
+                    "text":       f"📄 *{filename_att}*\n\n{preview}",
+                    "parse_mode": "Markdown",
+                })
+                await _edit_message(chat_id, message_id, f"✅ `{filename_att}` letto e salvato nel contesto.")
+            else:
+                await _edit_message(chat_id, message_id, f"⚠️ Impossibile estrarre testo da `{filename_att}`.")
+        except Exception as e:
+            logger.error("callback | leggi_allegato errore: %s", e)
+            await _edit_message(chat_id, message_id, f"❌ Errore nella lettura dell'allegato.")
+        return
+
+    elif action == "salta_allegato":
+        parts        = raw_data.split(":", 2)
+        filename_att = parts[2] if len(parts) > 2 else "allegato"
+        await _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": "Saltato", "show_alert": False})
+        await _edit_message(chat_id, message_id, f"⏭ `{filename_att}` saltato.")
+        return
 
     elif action == "modifica":
         await _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": "✏️ Modalità modifica", "show_alert": False})
