@@ -210,7 +210,7 @@ def classify_with_llm(
     from database import get_existing_contact_types
     from models_config import CLASSIFIER_MODEL
 
-    system_prompt = _build_system_prompt(config, existing_ct, msg.detected_language)
+    system_prompt = _build_system_prompt(config, None, msg.detected_language)
 
     att_names     = ", ".join(msg.attachments) if msg.attachments else "nessuno"
     thread_block  = (
