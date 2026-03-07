@@ -593,11 +593,11 @@ async def process_email(client_id: str, email_data: dict) -> None:
         )
     except Exception as e:
         logger.error("worker.process | [%s] Errore classificazione: %s", client_name, e)
-        return
+        raise
 
     if not result.db_ids:
         logger.error("worker.process | [%s] Salvataggio DB fallito", client_name)
-        return
+        raise RuntimeError("Salvataggio DB fallito")
 
     email_id = result.db_ids["email_id"]
     logger.info("worker.process | [%s] Classificata → intent=%s thread_topic=%s priority=%d (email_id=%s)",
