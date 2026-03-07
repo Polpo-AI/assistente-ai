@@ -164,7 +164,7 @@ def _build_system_prompt(
     contact_type_hint = (
         f"Valori già usati per questo cliente (preferisci questi): {', '.join(existing_contact_types)}"
         if existing_contact_types
-        else "es: cliente, fornitore, partner, candidato, istituzione"
+        else "valori ammessi: cliente, fornitore, spam, personale, sconosciuto"
     )
 
     language_note = ""
@@ -256,7 +256,7 @@ Allegati: {att_names}{contact_block}
             intent = "altro"
 
         result = ClassificationResult(
-            contact_type=data.get("contact_type", "sconosciuto"),
+            contact_type=data.get("contact_type", "sconosciuto") if data.get("contact_type") in ("cliente","fornitore","spam","personale","sconosciuto") else "sconosciuto",
             intent=intent,
             priority=int(data.get("priority", 2)),
             confidence=float(data.get("confidence", 0.5)),
