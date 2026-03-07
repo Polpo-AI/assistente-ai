@@ -1,0 +1,87 @@
+{
+  "name": "TecnoDomus360",
+  "sector": "Edilizia e Impiantistica",
+  "business_description": "Azienda specializzata in ristrutturazioni edili complete e impianti elettrici civili e industriali. Lavoriamo su abitazioni private, uffici e capannoni. Offriamo un servizio chiavi in mano dalla progettazione alla consegna.",
+  "services_offered": "ristrutturazione completa appartamenti e ville, rifacimento bagni e cucine, impianti elettrici civili e industriali, domotica, impianti fotovoltaici, certificazioni elettriche (dichiarazione di conformità), preventivi gratuiti. NON facciamo impianti idraulici, gas o termoidraulici.",
+  "language": "Italiano",
+  "llm_tone": "professionale e cordiale",
+  "signature": "Cordiali saluti,\nTecnoDomus360",
+  "llm_persona": "",
+  "telegram_chat_id": "905291338",
+  "imap_host": "imap.zoho.eu",
+  "imap_port": 993,
+  "imap_user": "davide.decupis@polpo-ai.com",
+  "imap_password": "30MbUXcdB2yM",
+  "smtp_host": "smtp.zoho.eu",
+  "smtp_port": 587,
+  "contacts": {
+    "telefono": "",
+    "cellulare": "",
+    "email": "davide.decupis@polpo-ai.com",
+    "indirizzo": "",
+    "sito_web": ""
+  },
+  "orari": {
+    "lunedi": "08:00 - 18:00",
+    "martedi": "08:00 - 18:00",
+    "mercoledi": "08:00 - 18:00",
+    "giovedi": "08:00 - 18:00",
+    "venerdi": "08:00 - 17:00",
+    "sabato": "09:00 - 13:00",
+    "domenica": "chiuso",
+    "pausa_pranzo": "13:00 - 14:00"
+  },
+  "intent_list": [
+    "preventivo",
+    "sopralluogo",
+    "informazione",
+    "reclamo",
+    "pagamento",
+    "certificazione",
+    "spam",
+    "cortesia",
+    "altro"
+  ],
+  "priority_map": {
+    "preventivo": 2,
+    "sopralluogo": 2,
+    "informazione": 1,
+    "reclamo": 3,
+    "pagamento": 2,
+    "certificazione": 2,
+    "spam": 0,
+    "cortesia": 0,
+    "altro": 1
+  },
+  "intent_instructions": {
+    "preventivo": "Chiedi tipo di intervento, metratura approssimativa, comune/zona e disponibilità per sopralluogo. Non quotare prezzi senza sopralluogo.",
+    "sopralluogo": "Proponi disponibilità nella settimana successiva, mattina o pomeriggio. Conferma via email con indirizzo preciso.",
+    "informazione": "Rispondi in modo chiaro e conciso. Se fuori scope (idraulica, gas) indica che non è il nostro settore e suggerisci di rivolgersi a uno specialista.",
+    "reclamo": "Esprimi dispiacere, chiedi dettagli specifici sul problema e proponi un sopralluogo entro 48h per valutare la situazione.",
+    "pagamento": "Indica IBAN e numero fattura di riferimento. Conferma la ricezione del pagamento non appena accreditato.",
+    "certificazione": "Chiedi indirizzo impianto, tipo di certificazione richiesta (dichiarazione conformità, collaudo, VVFF) e scadenze eventuali."
+  },
+  "faq": [
+    {
+      "domanda": "Fate anche impianti idraulici o del gas?",
+      "risposta": "No, la nostra specializzazione è l'edilizia e gli impianti elettrici. Per impianti idraulici o del gas ti consigliamo di contattare un idraulico certificato."
+    },
+    {
+      "domanda": "Il sopralluogo è gratuito?",
+      "risposta": "Sì, il sopralluogo e il preventivo sono completamente gratuiti e senza impegno."
+    },
+    {
+      "domanda": "Rilasciate la dichiarazione di conformità dell'impianto elettrico?",
+      "risposta": "Sì, per ogni impianto elettrico realizzato o certificato rilasciamo regolare dichiarazione di conformità ai sensi del DM 37/2008."
+    },
+    {
+      "domanda": "Quanto tempo richiede una ristrutturazione completa?",
+      "risposta": "Dipende dalla metratura e dagli interventi richiesti. Per un appartamento di 80-100mq stimiamo mediamente 6-10 settimane. I tempi precisi vengono definiti in fase di preventivo."
+    }
+  ],
+  "intent_keywords": {},
+  "custom_spam_keywords": [],
+  "logo_path": "",
+  "template_path": "",
+  "smtp_user": "davide.decupis@polpo-ai.com"
+}
