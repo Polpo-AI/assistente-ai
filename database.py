@@ -304,6 +304,15 @@ def ignore_draft(draft_id: str) -> dict:
     return result.data[0]
 
 
+
+def update_draft_status(draft_id: str, status: str) -> dict:
+    """Aggiorna lo stato di una bozza."""
+    db = get_client()
+    result = db.table("draft_responses").update({
+        "status": status,
+    }).eq("id", draft_id).execute()
+    return result.data[0] if result.data else {}
+
 def mark_email_no_reply(email_id: str, summary: str = "") -> dict:
     """
     Crea una voce in draft_responses con stato 'no_reply_needed' per email Priority 0.

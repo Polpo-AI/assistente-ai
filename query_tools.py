@@ -91,7 +91,7 @@ TOOLS = [
             "properties": {
                 "status": {
                     "type": "string",
-                    "enum": ["pending", "approved", "ignored", "sent"],
+                    "enum": ["pending", "approved", "ignored", "sent", "snoozed"],
                     "description": "Stato della bozza",
                 },
                 "limit": {"type": "integer", "description": "Numero massimo (default: 20)"},

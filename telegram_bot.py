@@ -42,6 +42,7 @@ from database import (
     update_draft_body,
     get_client_id_by_telegram_chat_id,
     get_client as get_db,
+    update_draft_status,
 )
 from attachment_reader import extract_pending_attachment
 from responder import refine_draft
@@ -286,8 +287,9 @@ async def _handle_callback(cq: dict) -> None:
 
     elif action == "snooze":
         await _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": "⏸ Rimandato", "show_alert": False})
+        update_draft_status(draft_id, "snoozed")
         await _edit_message(chat_id, message_id, _format_message(draft) + "\n\n⏸ *Lasciato per dopo* — gestisci dalla dashboard.")
-        logger.info("callback | draft_id=%s snooze, bottoni rimossi", draft_id[:8])
+        logger.info("callback | draft_id=%s snoozed salvato su DB", draft_id[:8])
 
     elif action == "leggi_allegato":
         parts        = raw_data.split(":", 2)
