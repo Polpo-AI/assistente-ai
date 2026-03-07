@@ -463,6 +463,44 @@ def mostra_riepilogo(dati):
 # Salvataggio su Supabase
 # ─────────────────────────────────────────────
 
+def rileva_ultimo_uid(imap_host: str, imap_port: int, imap_user: str, imap_password: str) -> int:
+    """
+    Si connette all'IMAP e recupera l'ultimo UID esistente.
+    Così il worker parte solo dalle email NUOVE, non riprocessa tutto.
+    Restituisce 0 in caso di errore.
+    """
+    import imaplib
+    try:
+        password = imap_password.replace(" ", "")
+        host = imap_host.split(":")[0]
+
+        print("\n  Connessione IMAP per rilevare ultimo UID...")
+        if imap_port == 993:
+            mail = imaplib.IMAP4_SSL(host, imap_port)
+        else:
+            mail = imaplib.IMAP4(host, imap_port)
+
+        mail.login(imap_user, password)
+        mail.select("INBOX")
+        _, data = mail.search(None, "ALL")
+        mail.logout()
+
+        if data and data[0]:
+            uids = data[0].split()
+            if uids:
+                last_uid = int(uids[-1])
+                print(f"  ✅ Ultimo UID rilevato: {last_uid} — il bot partirà dalle email successive")
+                return last_uid
+
+        print("  ℹ️  Nessuna email in INBOX — il bot partirà da zero")
+        return 0
+
+    except Exception as e:
+        print(f"  ⚠️  Impossibile rilevare UID IMAP: {e}")
+        print(f"  ℹ️  imap_last_uid impostato a 0 — verifica manualmente se necessario")
+        return 0
+
+
 def salva_cliente(dati: dict) -> str:
     db = get_db()
     result = db.table("clients").insert({
@@ -493,8 +531,21 @@ def salva_cliente(dati: dict) -> str:
         "smtp_password":        dati.get("smtp_password"),
         "logo_storage_path":    "",   # aggiornato dopo upload
         "template_storage_path": "",  # aggiornato dopo upload
+        "imap_last_uid":         0,   # aggiornato subito dopo
     }).execute()
-    return result.data[0]["id"]
+    client_id = result.data[0]["id"]
+
+    # Rileva ultimo UID IMAP e aggiorna subito — così il bot non rilegge tutto
+    last_uid = rileva_ultimo_uid(
+        dati.get("imap_host", ""),
+        dati.get("imap_port", 993),
+        dati.get("imap_user", ""),
+        dati.get("imap_password", ""),
+    )
+    if last_uid > 0:
+        db.table("clients").update({"imap_last_uid": last_uid}).eq("id", client_id).execute()
+
+    return client_id
 
 
 def aggiorna_asset_paths(client_id: str, logo_path: str, template_path: str) -> None:
