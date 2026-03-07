@@ -134,6 +134,7 @@ class ClassificationResult:
     classified_by:   str            # "filter" | "llm" | "llm_fallback"
     summary:         str            # descrive l'intent corrente, non il thread
     estimated_value: Optional[float] = None
+    thread_topic:    str = ""
     db_ids:          Optional[dict] = None
 
 
@@ -251,7 +252,7 @@ Allegati: {att_names}{contact_block}
         result = ClassificationResult(
             contact_type="sconosciuto",
             intent=intent,
-            priority=int(data.get("priority", 2)),
+            priority=int(data.get("priority", 2)) if data.get("intent", "altro") == "spam" or int(data.get("priority", 2)) > 0 else 2,
             confidence=float(data.get("confidence", 0.5)),
             classified_by="llm",
             summary=data.get("summary", ""),
