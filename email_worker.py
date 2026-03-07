@@ -317,6 +317,34 @@ async def fetch_new_emails_imap(client: dict) -> list[dict]:
         await imap.login(client["imap_user"], imap_password)
         logger.info("worker.imap | [%s] Login effettuato", client["name"])
 
+        # ── Calibrazione silenziosa al primo avvio ──────────────────────
+        # Se imap_last_uid è 0 (cliente nuovo o mai calibrato),
+        # imposta l'UID all'ultima email esistente senza processare nulla.
+        # Il bot inizierà a rispondere solo alle email successive.
+        if last_uid_global == 0:
+            await imap.select("INBOX")
+            _, cal_data = await imap.search("ALL")
+            cal_seqs = [s for s in cal_data[0].decode().split() if s.strip()]
+            if cal_seqs:
+                _, hdr_data = await imap.fetch(cal_seqs[-1], "(UID)")
+                cal_uid = 0
+                for part in hdr_data:
+                    if isinstance(part, (bytes, bytearray)):
+                        m = re.search(rb"UID (\d+)", bytes(part))
+                        if m:
+                            cal_uid = int(m.group(1))
+                            break
+                if cal_uid > 0:
+                    update_last_uid(client_id, cal_uid)
+                    logger.info(
+                        "worker.imap | [%s] Prima attivazione — calibrazione silenziosa UID=%d. "
+                        "Il bot processerà solo le email successive.",
+                        client["name"], cal_uid
+                    )
+            await imap.logout()
+            return []
+        # ───────────────────────────────────────────────────────────────
+
         emails_found = []
 
         for folder in ["INBOX"]:
@@ -573,8 +601,8 @@ async def process_email(client_id: str, email_data: dict) -> None:
         return
 
     email_id = result.db_ids["email_id"]
-    logger.info("worker.process | [%s] Classificata → intent=%s priority=%d (email_id=%s)",
-                client_name, result.intent,
+    logger.info("worker.process | [%s] Classificata → intent=%s thread_topic=%s priority=%d (email_id=%s)",
+                client_name, result.intent, result.thread_topic or "—",
                 result.priority, email_id)
 
     # 2. Salva enrichments nel DB
@@ -587,7 +615,7 @@ async def process_email(client_id: str, email_data: dict) -> None:
         quoted_text=email_data.get("quoted_text", ""),
         quoted_nested=email_data.get("quoted_nested", False),
         detected_language=email_data.get("detected_language", ""),
-        thread_topic="",
+        thread_topic=result.thread_topic or "",
     )
 
     # 3. Allegati — screening Haiku + estrazione Sonnet
