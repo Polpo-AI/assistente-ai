@@ -161,11 +161,6 @@ def _build_system_prompt(
     existing_contact_types: list = None,
     detected_language: str = "unknown",
 ) -> str:
-    contact_type_hint = (
-        f"Valori già usati per questo cliente (preferisci questi): {', '.join(existing_contact_types)}"
-        if existing_contact_types
-        else "valori ammessi: cliente, fornitore, spam, personale, sconosciuto"
-    )
 
     language_note = ""
     if detected_language and detected_language not in ("unknown", "it"):
@@ -178,7 +173,6 @@ def _build_system_prompt(
 
 Analizza l'email e rispondi SOLO con JSON valido:
 {{
-  "contact_type": "ruolo strutturale del mittente ({contact_type_hint})",
   "intent": {config.all_intents_str()} | "spam",
   "priority": 0 | 1 | 2 | 3,
   "confidence": 0.0-1.0,
@@ -216,7 +210,6 @@ def classify_with_llm(
     from database import get_existing_contact_types
     from models_config import CLASSIFIER_MODEL
 
-    existing_ct   = get_existing_contact_types(config.client_id)
     system_prompt = _build_system_prompt(config, existing_ct, msg.detected_language)
 
     att_names     = ", ".join(msg.attachments) if msg.attachments else "nessuno"
@@ -256,7 +249,7 @@ Allegati: {att_names}{contact_block}
             intent = "altro"
 
         result = ClassificationResult(
-            contact_type=data.get("contact_type", "sconosciuto") if data.get("contact_type") in ("cliente","fornitore","spam","personale","sconosciuto") else "sconosciuto",
+            contact_type="sconosciuto",
             intent=intent,
             priority=int(data.get("priority", 2)),
             confidence=float(data.get("confidence", 0.5)),
