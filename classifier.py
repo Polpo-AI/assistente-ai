@@ -329,8 +329,6 @@ def classify_message(
             )
 
             # Il contact_type dal DB ha sempre precedenza su quello inferito dall'LLM
-            if contact_type_hint:
-                result.contact_type = contact_type_hint
 
         else:
             logger.warning("classify | client=%s email=%s — nessun LLM disponibile",
