@@ -318,9 +318,8 @@ async def fetch_new_emails_imap(client: dict) -> list[dict]:
         logger.info("worker.imap | [%s] Login effettuato", client["name"])
 
         # ── Calibrazione silenziosa al primo avvio ──────────────────────
-        # Se imap_last_uid è 0 (cliente nuovo o mai calibrato),
-        # imposta l'UID all'ultima email esistente senza processare nulla.
-        # Il bot inizierà a rispondere solo alle email successive.
+        # Se imap_last_uid è 0, imposta l'UID all'ultima email esistente
+        # senza processare nulla. Il bot parte dalle email successive.
         if last_uid_global == 0:
             await imap.select("INBOX")
             _, cal_data = await imap.search("ALL")
@@ -343,7 +342,7 @@ async def fetch_new_emails_imap(client: dict) -> list[dict]:
                     )
             await imap.logout()
             return []
-        # ───────────────────────────────────────────────────────────────
+        # ────────────────────────────────────────────────────────────────
 
         emails_found = []
 
@@ -810,8 +809,9 @@ async def imap_polling_loop() -> None:
                             await process_email(client_id, email_data)
                             max_uid = max(max_uid, email_data["uid"])
                         except Exception as inner_e:
-                            logger.error("worker.imap | [%s] Errore UID %s: %s",
+                            logger.error("worker.imap | [%s] Errore UID %s: %s — verrà ritentata al prossimo ciclo",
                                          client_name, email_data.get("uid"), inner_e)
+                            # NON avanziamo max_uid: l'email verrà riletta al prossimo polling
 
                     if max_uid > int(client.get("imap_last_uid") or 0):
                         update_last_uid(client_id, max_uid)
