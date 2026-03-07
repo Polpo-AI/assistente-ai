@@ -573,7 +573,7 @@ async def process_email(client_id: str, email_data: dict) -> None:
         return
 
     email_id = result.db_ids["email_id"]
-    logger.info("worker.process | [%s] Classificata → intent=%s thread_topic=%s priority=%d (email_id=%s)",
+    logger.info("worker.process | [%s] Classificata → intent=%s priority=%d (email_id=%s)",
                 client_name, result.intent,
                 result.priority, email_id)
 

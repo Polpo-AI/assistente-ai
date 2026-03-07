@@ -29,6 +29,11 @@ from anthropic import Anthropic
 from anthropic.types import MessageParam
 from dotenv import load_dotenv
 
+# Stato in memoria per le modifiche bozze in corso
+_pending_edits: dict = {}  # { chat_id: draft_id }
+
+# Stato in memoria per le modifiche bozze in corso
+
 from database import (
     get_draft_by_id,
     approve_draft,
