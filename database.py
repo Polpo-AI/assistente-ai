@@ -539,15 +539,15 @@ def q_emails_in_range(client_id: str, date_from: str, date_to: str, limit: int =
     return res.data
 
 def q_top_senders(client_id: str, date_from: str, date_to: str, limit: int = 5) -> list[dict]:
-    # Non essendoci GROUP BY nativo nell'API Supabase free-tier, recuperiamo le email e raggruppiamo in Python
-    # Per grosse moli andrebbe fatta una stored procedure RPC.
-    rows = q_emails_in_range(client_id, date_from, date_to, limit=1000)
-    counts = {}
-    for r in rows:
-        email = r.get("sender_email", "sconosciuto")
-        counts[email] = counts.get(email, 0) + 1
-    sorted_senders = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:limit]
-    return [{"sender_email": k, "count": v} for k, v in sorted_senders]
+    """Recupera i mittenti principali tramite procedura RPC sul DB."""
+    db = get_client()
+    res = db.rpc("rpc_top_senders", {
+        "p_client_id": client_id,
+        "p_date_from": f"{date_from}T00:00:00Z",
+        "p_date_to": f"{date_to}T23:59:59Z",
+        "p_limit": limit
+    }).execute()
+    return res.data
 
 def q_unanswered_emails(client_id: str, limit: int = 20) -> list[dict]:
     db = get_client()
@@ -589,25 +589,14 @@ def q_intent_stats(client_id: str, date_from: str, date_to: str) -> list[dict]:
     return [{"intent": k, "count": v} for k, v in counts.items()]
 
 def q_daily_volume(client_id: str, date_from: str, date_to: str) -> list[dict]:
-    # Stessa cosa, mock in python raggruppando (RPC sarebbe meglio)
-    emails = q_emails_in_range(client_id, date_from, date_to, limit=1000)
-    drafts = q_drafts_sent_in_range(client_id, date_from, date_to, limit=1000)
-    
-    days = {}
-    for e in emails:
-        d = e.get("received_at", "")[:10]
-        if d:
-            if d not in days: days[d] = {"received": 0, "sent": 0}
-            days[d]["received"] += 1
-            
-    for dr in drafts:
-        d = dr.get("sent_at", "")[:10]
-        if d:
-            if d not in days: days[d] = {"received": 0, "sent": 0}
-            days[d]["sent"] += 1
-            
-    res = [{"day": k, "received": v["received"], "sent": v["sent"]} for k, v in days.items()]
-    return sorted(res, key=lambda x: x["day"])
+    """Recupera il volume giornaliero tramite procedura RPC sul DB."""
+    db = get_client()
+    res = db.rpc("rpc_daily_volume", {
+        "p_client_id": client_id,
+        "p_date_from": f"{date_from}T00:00:00Z",
+        "p_date_to": f"{date_to}T23:59:59Z"
+    }).execute()
+    return res.data
 
 def add_sender_to_blacklist(client_id: str, sender_email: str) -> bool:
     """Aggiunge un mittente alle custom_spam_keywords del tenant (così le prossime andranno in spam_ignored)."""
@@ -696,7 +685,7 @@ def save_chat_message(client_id: str, chat_id: str, role: str, content: any) -> 
         return True
     except Exception as e:
         logger.error(f"Errore save_chat_message: {e}")
-        return False
+        raise e
 
 def get_chat_history(chat_id: str, limit: int = 10) -> list:
     """Recupera gli ultimi N messaggi della chat per il conteggio context."""

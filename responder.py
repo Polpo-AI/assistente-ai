@@ -182,7 +182,7 @@ Allegati: {', '.join(ctx.attachments) if ctx.attachments else 'nessuno'}
         
         # Estrazione robusta del JSON (gestisce markdown blocks ```json ... ```)
         import re
-        json_match = re.search(r"\{.*\}", raw_text, re.DOTALL)
+        json_match = re.search(r"\{.*?\}", raw_text, re.DOTALL)
         if json_match:
             json_text = json_match.group(0)
             data = json.loads(json_text)
@@ -472,7 +472,7 @@ def refine_draft(
         raw = response.content[0].text.strip()
         
         # Estrazione robusta JSON
-        json_match = _re.search(r"\{.*\}", raw, _re.DOTALL)
+        json_match = _re.search(r"\{.*?\}", raw, _re.DOTALL)
         if json_match:
             data = json.loads(json_match.group(0))
         else:

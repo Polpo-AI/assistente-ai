@@ -562,7 +562,6 @@ async def process_email(client_id: str, email_data: dict) -> None:
     logger.info("worker.process | [%s] Elaboro email da %s: %s",
                 client_name, email_data.get("sender_email"), email_data.get("subject"))
 
-    llm_client      = Anthropic()
     raw_attachments = email_data.get("raw_attachments", [])
 
     # Corpo per il classifier — se vuoto ma con allegati, segnalalo
@@ -586,7 +585,7 @@ async def process_email(client_id: str, email_data: dict) -> None:
             classify_message,
             msg=msg,
             client_id=client_id,
-            llm_client=llm_client,
+            llm_client=anthropic_client,
             use_real_db=True,
             save_to_db=True,
             quoted_text=email_data.get("quoted_text", ""),
@@ -625,7 +624,7 @@ async def process_email(client_id: str, email_data: dict) -> None:
             process_email_attachments,
             email_id,
             raw_attachments,
-            llm_client,
+            anthropic_client,
             email_data.get("subject", ""),
             email_data.get("body", ""),
         )
@@ -659,7 +658,7 @@ async def process_email(client_id: str, email_data: dict) -> None:
     # 4. Genera bozza con Sonnet
     draft = None
     try:
-        draft = await asyncio.to_thread(generate_response_draft, email_id, llm_client)
+        draft = await asyncio.to_thread(generate_response_draft, email_id, anthropic_client)
     except Exception as e:
         err = str(e)
         logger.error("worker.process | [%s] Eccezione generazione bozza: %s", client_name, err)
