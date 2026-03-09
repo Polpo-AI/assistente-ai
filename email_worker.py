@@ -36,7 +36,7 @@ import aioimaplib
 import aiosmtplib
 from dotenv import load_dotenv
 
-from database import get_client as get_db, mark_email_no_reply, mark_draft_generation_failed
+from database import get_client as get_db, mark_email_no_reply, mark_draft_generation_failed, get_approved_drafts
 from classifier import classify_message, InboundMessage
 from responder import generate_response_draft
 import telegram_bot
@@ -55,6 +55,15 @@ logger = logging.getLogger("polpo.worker")
 IMAP_POLL_INTERVAL     = 60
 APPROVED_POLL_INTERVAL = 30
 IMAP_TIMEOUT           = 30
+SMTP_MAX_CONCURRENT    = 3  # max connessioni SMTP simultanee
+
+_smtp_semaphore: asyncio.Semaphore | None = None
+
+def _get_smtp_semaphore() -> asyncio.Semaphore:
+    global _smtp_semaphore
+    if _smtp_semaphore is None:
+        _smtp_semaphore = asyncio.Semaphore(SMTP_MAX_CONCURRENT)
+    return _smtp_semaphore
 
 anthropic_client = Anthropic()
 
@@ -202,16 +211,7 @@ def update_last_uid(client_id: str, uid: int) -> None:
     get_db().table("clients").update({"imap_last_uid": uid}).eq("id", client_id).execute()
 
 
-def get_approved_drafts() -> list[dict]:
-    result = (
-        get_db().table("draft_responses")
-        .select("id, client_id, subject, body, email_id, telegram_message_id, "
-                "emails(sender_email, sender_name, subject, message_id), "
-                "clients(smtp_host, smtp_port, smtp_user, smtp_password, name, telegram_chat_id)")
-        .eq("status", "approved")
-        .execute()
-    )
-    return result.data or []
+from database import get_approved_drafts
 
 
 def mark_draft_sent(draft_id: str, sent_message_id: str) -> None:
@@ -689,14 +689,8 @@ async def process_email(client_id: str, email_data: dict) -> None:
 # SMTP — invio bozze approvate
 # ─────────────────────────────────────────────
 
-async def send_email_smtp(draft: dict) -> None:
-    """
-    Invia una bozza approvata via SMTP.
-    - Genera un Message-ID univoco prima dell'invio
-    - Salva un record outbound nella tabella emails per il threading
-    - Aggiorna draft_responses con sent_message_id e status='sent'
-    """
-    draft_id    = draft["id"]
+async def _send_email_smtp_inner(draft: dict) -> None:
+    """Core invio SMTP — chiamato sempre dentro il semaforo."""    draft_id    = draft["id"]
     client_id   = draft["client_id"]
     client_smtp = draft.get("clients") or {}
     email_orig  = draft.get("emails") or {}
@@ -781,9 +775,49 @@ async def send_email_smtp(draft: dict) -> None:
             await telegram_bot.update_card_failed(tg_chat_id, tg_msg_id, draft, err)
 
 
+async def send_email_smtp(draft: dict) -> None:
+    """
+    Invia una bozza approvata via SMTP.
+    Limita le connessioni simultanee a SMTP_MAX_CONCURRENT tramite semaforo.
+    """
+    async with _get_smtp_semaphore():
+        await _send_email_smtp_inner(draft)
+
+
 # ─────────────────────────────────────────────
 # LOOP 1 — IMAP Polling
 # ─────────────────────────────────────────────
+
+async def _process_client_imap(client: dict, global_max_uid: dict) -> None:
+    """Processa le nuove email IMAP per un singolo cliente — eseguito in parallelo."""
+    client_id   = client["id"]
+    client_name = client.get("name", client_id)
+    try:
+        new_emails = await fetch_new_emails_imap(client)
+        if not new_emails:
+            return
+
+        max_uid = int(client.get("imap_last_uid") or 0)
+        for email_data in new_emails:
+            email_data["_client_name"] = client_name
+            if email_data.get("_skip"):
+                max_uid = max(max_uid, email_data["uid"])
+                continue
+            try:
+                await process_email(client_id, email_data)
+                max_uid = max(max_uid, email_data["uid"])
+            except Exception as inner_e:
+                logger.error(
+                    "worker.imap | [%s] Errore UID %s: %s — verrà ritentata al prossimo ciclo",
+                    client_name, email_data.get("uid"), inner_e
+                )
+
+        if max_uid > int(client.get("imap_last_uid") or 0):
+            update_last_uid(client_id, max_uid)
+
+    except Exception as e:
+        logger.error("worker.imap | [%s] Errore ciclo: %s", client_name, e)
+
 
 async def imap_polling_loop() -> None:
     logger.info("worker | ▶ IMAP polling loop avviato (ogni %ds)", IMAP_POLL_INTERVAL)
@@ -791,34 +825,12 @@ async def imap_polling_loop() -> None:
     while True:
         try:
             clients = get_active_clients_with_email()
-            for client in clients:
-                client_id   = client["id"]
-                client_name = client.get("name", client_id)
-                try:
-                    new_emails = await fetch_new_emails_imap(client)
-                    if not new_emails:
-                        continue
-
-                    max_uid = int(client.get("imap_last_uid") or 0)
-                    for email_data in new_emails:
-                        email_data["_client_name"] = client_name
-                        if email_data.get("_skip"):
-                            max_uid = max(max_uid, email_data["uid"])
-                            continue
-                        try:
-                            await process_email(client_id, email_data)
-                            max_uid = max(max_uid, email_data["uid"])
-                        except Exception as inner_e:
-                            logger.error("worker.imap | [%s] Errore UID %s: %s — verrà ritentata al prossimo ciclo",
-                                         client_name, email_data.get("uid"), inner_e)
-                            # NON avanziamo max_uid: l'email verrà riletta al prossimo polling
-
-                    if max_uid > int(client.get("imap_last_uid") or 0):
-                        update_last_uid(client_id, max_uid)
-
-                except Exception as e:
-                    logger.error("worker.imap | [%s] Errore ciclo: %s", client_name, e)
-
+            if clients:
+                # Tutti i clienti in parallelo — nessuno aspetta l'altro
+                await asyncio.gather(
+                    *[_process_client_imap(client, {}) for client in clients],
+                    return_exceptions=True,
+                )
         except Exception as e:
             logger.error("worker.imap | Errore generale: %s", e)
 

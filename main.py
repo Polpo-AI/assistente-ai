@@ -140,13 +140,15 @@ async def classify(email: IncomingEmail):
             save_to_db=True,
         )
 
-        # Se priorità >= 2, invia subito notifica Telegram (ora asincrono)
-        if result.priority >= 2:
-            # Recuperiamo l'ID della bozza se creata (di solito con priority >= 2 viene creata subito)
-            # In questo semplice classificatore, dobbiamo assicurarci che la bozza esista
-            # Al momento classify_message non crea la bozza, lo fa create_draft o il worker.
-            # Se classify_message ha aggiunto gli ID al DB, possiamo procedere.
-            pass
+        # Se priorità >= 2, genera subito la bozza e notifica Telegram
+        if result.priority >= 2 and result.db_ids:
+            email_id_for_draft = result.db_ids["email_id"]
+            try:
+                draft = generate_response_draft(email_id_for_draft, anthropic_client)
+                if draft and draft.draft_id:
+                    await telegram_bot.notify_draft(draft.draft_id)
+            except Exception as e:
+                logger.warning("classify | notifica Telegram fallita: %s", e)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Errore classificazione: {str(e)}")
 

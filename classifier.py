@@ -252,7 +252,7 @@ Allegati: {att_names}{contact_block}
         result = ClassificationResult(
             contact_type="sconosciuto",
             intent=intent,
-            priority=int(data.get("priority", 2)) if data.get("intent", "altro") == "spam" or int(data.get("priority", 2)) > 0 else 2,
+            priority=int(data.get("priority", 2)),
             confidence=float(data.get("confidence", 0.5)),
             classified_by="llm",
             summary=data.get("summary", ""),

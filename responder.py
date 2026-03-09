@@ -58,6 +58,7 @@ class EmailContext:
     email_body:           str
     email_subject:        str
     attachments:          list[str] = field(default_factory=list)
+    attachments_text:     dict = field(default_factory=dict)
     estimated_value:      Optional[float] = None
     conversation_history: list[dict] = field(default_factory=list)
 
@@ -100,6 +101,10 @@ def load_email_context(email_id: str) -> Optional[EmailContext]:
     if row.get("conversation_id"):
         history = get_conversation_history(row["conversation_id"], limit=3)
 
+    # Leggi testo allegati estratti
+    from attachment_reader import get_attachments_text, format_attachments_for_prompt
+    attachments_text = get_attachments_text(email_id)
+
     return EmailContext(
         email_id=email_id,
         client_id=row["client_id"],
@@ -112,6 +117,7 @@ def load_email_context(email_id: str) -> Optional[EmailContext]:
         email_body=row.get("body", ""),
         email_subject=row.get("subject", ""),
         attachments=row.get("attachments") or [],
+        attachments_text=attachments_text,
         estimated_value=row.get("estimated_value"),
         conversation_history=history,
     )
@@ -213,6 +219,7 @@ def generate_draft(
     final_intent: str,
     client: Anthropic,
 ) -> tuple[str, str, list[str]]:
+    from attachment_reader import format_attachments_for_prompt
     """
     Genera la bozza con Sonnet usando tono, firma e istruzioni del cliente.
     Restituisce (subject, body, suggested_actions).
@@ -257,7 +264,7 @@ EMAIL DA GESTIRE:
 {history_text}
 TESTO EMAIL:
 {ctx.email_body[:2000]}
-
+{format_attachments_for_prompt(ctx.attachments_text) if ctx.attachments_text else ''}
 ISTRUZIONI PER QUESTO INTENT ({final_intent}):
 {instructions}
 """
@@ -474,10 +481,13 @@ def refine_draft(
         new_subject = data.get("subject", draft.get("subject", ""))
         new_body    = data.get("body", draft.get("body", ""))
         feedback    = data.get("feedback", "Bozza aggiornata con successo.")
-        
+
         update_draft_body(draft_id, new_subject, new_body)
         logger.info("refine_draft | draft_id=%s bozza aggiornata. Feedback: %s", draft_id[:8], feedback)
-        return new_subject, new_body, feedback
+
+        # Restituisce anche la draft aggiornata per evitare una seconda query nel bot
+        updated_draft = {**draft, "subject": new_subject, "body": new_body}
+        return new_subject, new_body, feedback, updated_draft
     except Exception as e:
         logger.error("refine_draft | draft_id=%s errore: %s", draft_id[:8], e)
         return None

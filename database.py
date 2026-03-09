@@ -27,14 +27,19 @@ logger = logging.getLogger("polpo.database")
 # Client singleton
 # ─────────────────────────────────────────────
 
+import threading
+
 _supabase: Optional[Client] = None
+_supabase_lock = threading.Lock()
 
 def get_client() -> Client:
     global _supabase
     if _supabase is None:
-        url = os.environ["SUPABASE_URL"]
-        key = os.environ["SUPABASE_KEY"]
-        _supabase = create_client(url, key)
+        with _supabase_lock:
+            if _supabase is None:  # double-checked locking
+                url = os.environ["SUPABASE_URL"]
+                key = os.environ["SUPABASE_KEY"]
+                _supabase = create_client(url, key)
     return _supabase
 
 
@@ -349,16 +354,11 @@ def mark_email_no_reply(email_id: str, summary: str = "") -> dict:
 
 
 def mark_draft_generation_failed(email_id: str, error: str) -> None:
-    """
-    Registra il fallimento della generazione bozza su un'email.
-    Imposta draft_generation_status='failed' sulla tabella emails.
-    Il worker Telegram-alert viene triggerato separatamente.
-    """
     try:
         get_client().table("emails").update({
             "draft_generation_status": "failed",
-            "draft_generation_error":  error[:500],
         }).eq("id", email_id).execute()
+        logger.warning("mark_draft_generation_failed | email_id=%s errore: %s", email_id, error[:200])
     except Exception as e:
         logger.error("mark_draft_generation_failed | email_id=%s: %s", email_id, e)
 
@@ -572,8 +572,14 @@ def q_pending_older_than(client_id: str, hours: int, limit: int = 20) -> list[di
     return res.data
 
 def q_intent_stats(client_id: str, date_from: str, date_to: str) -> list[dict]:
+    # email_classifications non ha client_id — filtriamo via join con emails
     db = get_client()
-    res = db.table("email_classifications").select("intent").eq("client_id", client_id).gte("created_at", f"{date_from}T00:00:00Z").lte("created_at", f"{date_to}T23:59:59Z").execute()
+    res = db.table("email_classifications") \
+        .select("intent, emails!inner(client_id, received_at)") \
+        .eq("emails.client_id", client_id) \
+        .gte("emails.received_at", f"{date_from}T00:00:00Z") \
+        .lte("emails.received_at", f"{date_to}T23:59:59Z") \
+        .execute()
     counts = {}
     for r in res.data:
         i = r.get("intent", "altro")
@@ -616,8 +622,64 @@ def add_sender_to_blacklist(client_id: str, sender_email: str) -> bool:
 
 
 # ─────────────────────────────────────────────
-# CHAT HISTORY
+# PENDING EDITS — stato modifica bozza Telegram
+# Spostato su DB per supportare multi-worker FastAPI
 # ─────────────────────────────────────────────
+
+def set_pending_edit(chat_id: str, draft_id: str, client_id: Optional[str] = None) -> None:
+    """
+    Registra che un operatore sta modificando una bozza.
+    client_id opzionale: se non passato viene ricavato dal DB (query extra).
+    Passarlo direttamente dal bot quando già disponibile per evitare la query.
+    """
+    db = get_client()
+    if not client_id:
+        client_id = get_client_id_by_telegram_chat_id(chat_id)
+    if not client_id:
+        logger.warning("set_pending_edit | client_id non trovato per chat_id=%s", chat_id)
+        return
+    db.table("chat_history").insert({
+        "client_id": client_id,
+        "chat_id":   str(chat_id),
+        "role":      "system",
+        "content":   {"_type": "pending_edit", "draft_id": draft_id},
+    }).execute()
+
+
+def get_pending_edit(chat_id: str) -> Optional[str]:
+    """Restituisce il draft_id in attesa di modifica per questo chat, o None."""
+    db = get_client()
+    result = (
+        db.table("chat_history")
+        .select("id, content")
+        .eq("chat_id", str(chat_id))
+        .order("created_at", desc=True)
+        .limit(5)
+        .execute()
+    )
+    for row in result.data or []:
+        content = row.get("content", {})
+        if isinstance(content, dict) and content.get("_type") == "pending_edit":
+            return content.get("draft_id")
+    return None
+
+
+def clear_pending_edit(chat_id: str) -> None:
+    """Rimuove il pending edit per questo chat dopo che è stato processato."""
+    db = get_client()
+    result = (
+        db.table("chat_history")
+        .select("id, content")
+        .eq("chat_id", str(chat_id))
+        .order("created_at", desc=True)
+        .limit(5)
+        .execute()
+    )
+    for row in result.data or []:
+        content = row.get("content", {})
+        if isinstance(content, dict) and content.get("_type") == "pending_edit":
+            db.table("chat_history").delete().eq("id", row["id"]).execute()
+            return
 
 def save_chat_message(client_id: str, chat_id: str, role: str, content: any) -> bool:
     """Salva un messaggio della chat assistente (Telegram) su DB."""

@@ -20,6 +20,7 @@ Variabili d'ambiente richieste:
 """
 
 import os
+import asyncio
 import logging
 from typing import Optional
 
@@ -29,10 +30,7 @@ from anthropic import Anthropic
 from anthropic.types import MessageParam
 from dotenv import load_dotenv
 
-# Stato in memoria per le modifiche bozze in corso
-_pending_edits: dict = {}  # { chat_id: draft_id }
-
-# Stato in memoria per le modifiche bozze in corso
+# Stato in memoria per le modifiche bozze in corso — sostituito con DB per multi-worker
 
 from database import (
     get_draft_by_id,
@@ -43,12 +41,17 @@ from database import (
     get_client_id_by_telegram_chat_id,
     get_client as get_db,
     update_draft_status,
+    set_pending_edit,
+    get_pending_edit,
+    clear_pending_edit,
 )
+from email_worker import send_email_smtp
 from attachment_reader import extract_pending_attachment
 from responder import refine_draft
 import query_tools
 from notifications import notify_missing_feature
 from models_config import TELEGRAM_ASSISTANT_MODEL
+import database as db
 
 load_dotenv()
 
@@ -223,6 +226,25 @@ async def handle_update(data: dict) -> None:
         await _handle_message(data["message"])
 
 
+async def _send_and_update_card(draft: dict, chat_id: int, message_id: int) -> None:
+    """
+    Esegue l'invio SMTP in background e aggiorna la card Telegram al termine.
+    Separato dal callback per non bloccare la risposta all'operatore.
+    Il worker SMTP periodico skipperà questa draft (già in stato 'sent' o 'send_failed').
+    """
+    draft_id = draft["id"]
+    try:
+        await send_email_smtp(draft)  # aiosmtplib — async nativo, await diretto
+        await _edit_message(chat_id, message_id, _format_message(draft) + "\n\n📨 *Email inviata!*")
+        logger.info("_send_and_update_card | draft_id=%s inviata con successo", draft_id[:8])
+    except Exception as e:
+        logger.error("_send_and_update_card | draft_id=%s errore SMTP: %s", draft_id[:8], e)
+        await _edit_message(
+            chat_id, message_id,
+            _format_message(draft) + "\n\n❌ *Invio fallito.* Verifica le credenziali SMTP o riprova dalla dashboard."
+        )
+
+
 async def _handle_callback(cq: dict) -> None:
     """Gestisce i click sui bottoni inline."""
     callback_id = cq.get("id")
@@ -262,16 +284,17 @@ async def _handle_callback(cq: dict) -> None:
 
     if action == "invia":
         try:
-            # Stato intermedio: rimuovi bottoni e mostra "Invio in corso..."
             await _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": "⏳ Invio in corso...", "show_alert": False})
             await _edit_message_with_buttons(
                 chat_id, message_id,
                 _format_message(draft) + "\n\n⏳ _Invio in corso..._",
                 {"inline_keyboard": []}
             )
+            # Opt 4: approva e invia subito — non aspettiamo il worker (fino a 30s di delay)
             approve_draft(draft_id, approved_by="telegram")
-            # Lo stato finale "📨 Inviata!" arriverà da update_card_sent() nel worker SMTP
-            logger.info("callback | draft_id=%s approvata da Telegram", draft_id[:8])
+            # Esegue SMTP in un thread per non bloccare l'event loop
+            asyncio.create_task(_send_and_update_card(draft, chat_id, message_id))
+            logger.info("callback | draft_id=%s approvata — invio SMTP avviato", draft_id[:8])
         except Exception as e:
             await _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": "❌ Errore durante l'invio", "show_alert": True})
             logger.error("callback | errore invia: %s", e)
@@ -327,7 +350,8 @@ async def _handle_callback(cq: dict) -> None:
 
     elif action == "modifica":
         await _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": "✏️ Modalità modifica", "show_alert": False})
-        _pending_edits[str(chat_id)] = draft_id
+        # Opt 3: passa client_id già disponibile dalla draft — evita query extra in set_pending_edit
+        set_pending_edit(str(chat_id), draft_id, client_id=draft.get("client_id"))
         # Feedback immediato sulla card: rimuovi bottoni, mostra stato modifica
         await _edit_message_with_buttons(
             chat_id, message_id,
@@ -355,7 +379,7 @@ async def _handle_message(msg: dict) -> None:
         return
 
     # 1. È una modifica bozza in corso?
-    if chat_id in _pending_edits:
+    if get_pending_edit(chat_id):
         await _process_draft_edit(chat_id, text)
         return
 
@@ -365,15 +389,20 @@ async def _handle_message(msg: dict) -> None:
 
 async def _process_draft_edit(chat_id: str, instruction: str) -> None:
     """Modifica bozza e rimanda con bottoni."""
-    draft_id = _pending_edits.pop(chat_id)
+    draft_id = get_pending_edit(chat_id)
+    if not draft_id:
+        logger.warning("modifica | nessun pending edit trovato per chat_id=%s", chat_id)
+        return
+    clear_pending_edit(chat_id)
     logger.info("modifica | draft_id=%s istruzione ricevuta: %s", draft_id[:8], instruction[:50])
 
     # Notifica "Lavoro in corso"
     wait_msg = await _tg_post("sendMessage", {"chat_id": chat_id, "text": "⏳ _Sto elaborando la modifica..._", "parse_mode": "Markdown"})
     wait_msg_id = wait_msg.get("result", {}).get("message_id")
 
+    # Opt 1: refine_draft è sync e blocca l'event loop per 3-8s — lo eseguiamo in un thread
     anthropic_client = Anthropic()
-    res = refine_draft(draft_id, instruction, anthropic_client)
+    res = await asyncio.to_thread(refine_draft, draft_id, instruction, anthropic_client)
 
     if not res:
         if wait_msg_id:
@@ -381,7 +410,8 @@ async def _process_draft_edit(chat_id: str, instruction: str) -> None:
         await _tg_post("sendMessage", {"chat_id": chat_id, "text": "⚠️ *Errore nella modifica.* Il server non ha risposto correttamente. Riprova tra poco.", "parse_mode": "Markdown"})
         return
 
-    new_sub, new_body, feedback = res
+    # Opt 2: refine_draft restituisce già la draft aggiornata — nessuna query extra
+    new_sub, new_body, feedback, updated_draft = res
 
     # Rimuovi messaggio di attesa
     if wait_msg_id:
@@ -394,16 +424,62 @@ async def _process_draft_edit(chat_id: str, instruction: str) -> None:
         "parse_mode": "Markdown"
     })
 
-    # 2. Rimanda la card aggiornata
-    draft = get_draft_by_id(draft_id)
-    if draft:
-        await _tg_post("sendMessage", {
-            "chat_id": chat_id,
-            "text": _format_message(draft),
-            "parse_mode": "Markdown",
-            "reply_markup": _build_buttons(draft_id),
-        })
-        logger.info("modifica | draft_id=%s rimandato aggiornato", draft_id[:8])
+    # 2. Rimanda la card aggiornata — usa draft già in memoria, zero query DB
+    await _tg_post("sendMessage", {
+        "chat_id":      chat_id,
+        "text":         _format_message(updated_draft),
+        "parse_mode":   "Markdown",
+        "reply_markup": _build_buttons(draft_id),
+    })
+    logger.info("modifica | draft_id=%s rimandato aggiornato", draft_id[:8])
+
+
+def _sanitize_history(hist: list) -> list:
+    """
+    Rimuove dalla history messaggi assistant con tool_use non seguiti
+    dal corrispondente tool_result. Evita errore 400 Anthropic API
+    quando una conversazione era stata interrotta a metà loop tool.
+    """
+    if not hist:
+        return hist
+
+    clean = []
+    i = 0
+    while i < len(hist):
+        msg = hist[i]
+        content = msg.get("content", "")
+
+        # Controlla se è un messaggio assistant con tool_use
+        has_tool_use = False
+        if msg.get("role") == "assistant" and isinstance(content, list):
+            has_tool_use = any(
+                isinstance(b, dict) and b.get("type") == "tool_use"
+                for b in content
+            )
+
+        if has_tool_use:
+            # Deve essere seguito da un messaggio user con tool_result
+            next_msg = hist[i + 1] if i + 1 < len(hist) else None
+            next_content = next_msg.get("content", []) if next_msg else []
+            has_result = (
+                next_msg and
+                next_msg.get("role") == "user" and
+                isinstance(next_content, list) and
+                any(isinstance(b, dict) and b.get("type") == "tool_result" for b in next_content)
+            )
+            if has_result:
+                clean.append(msg)
+                clean.append(next_msg)
+                i += 2
+            else:
+                # Coppia incompleta — salta entrambi
+                logger.warning("_sanitize_history | tool_use orfano rimosso dalla history")
+                i += 1
+        else:
+            clean.append(msg)
+            i += 1
+
+    return clean
 
 
 async def _process_conversational_query(chat_id: str, text: str) -> None:
@@ -418,7 +494,12 @@ async def _process_conversational_query(chat_id: str, text: str) -> None:
 
     # Recupera lo storico dal DB (ultimi 10 messaggi)
     hist = db.get_chat_history(chat_id, limit=10)
-    
+
+    # Sanifica la history: rimuove coppie tool_use/tool_result incomplete
+    # che causano errore 400 dell'API Anthropic se la conversazione era
+    # stata interrotta a metà di un loop tool.
+    hist = _sanitize_history(hist)
+
     # Aggiunge il messaggio corrente (non ancora salvato)
     current_msg = {"role": "user", "content": text}
     # Salva subito il messaggio dell'utente su DB

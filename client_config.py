@@ -146,7 +146,7 @@ DEFAULT_INTENT_INSTRUCTIONS = {
 
 import time
 
-_CACHE_TTL_SECONDS = 300  # 5 minuti
+_CACHE_TTL_SECONDS = 60  # 60s — bilanciamento tra performance e freschezza in ambienti multi-worker
 _config_cache: dict = {}  # { client_id: (ClientConfig, timestamp) }
 
 
@@ -219,3 +219,24 @@ def get_client_id_by_name(name: str) -> Optional[str]:
 def invalidate_cache(client_id: str) -> None:
     """Rimuove il cliente dalla cache dopo modifiche."""
     _config_cache.pop(client_id, None)
+
+
+def update_client_config(client_id: str, updates: dict) -> bool:
+    """
+    Aggiorna la configurazione del cliente su Supabase e invalida la cache.
+    Chiamare da dashboard o API dopo ogni modifica alla config cliente.
+
+    Esempio:
+        update_client_config(client_id, {"llm_tone": "formale", "signature": "Distinti saluti"})
+    """
+    try:
+        db = get_client()
+        db.table("clients").update(updates).eq("id", client_id).execute()
+        invalidate_cache(client_id)
+        return True
+    except Exception as e:
+        import logging
+        logging.getLogger("polpo.client_config").error(
+            "update_client_config | client_id=%s errore: %s", client_id, e
+        )
+        return False
