@@ -535,7 +535,8 @@ def q_contact_emails(client_id: str, contact_email: str, limit: int = 10) -> lis
 
 def q_emails_in_range(client_id: str, date_from: str, date_to: str, limit: int = 50) -> list[dict]:
     db = get_client()
-    res = db.table("emails").select("*").eq("client_id", client_id).gte("received_at", f"{date_from}T00:00:00Z").lte("received_at", f"{date_to}T23:59:59Z").order("received_at", desc=True).limit(limit).execute()
+    # Non selezioniamo all attachments o l'intero body per risparmiare RAM e tempo di trasferimento
+    res = db.table("emails").select("id, received_at, sender_name, sender_email, subject").eq("client_id", client_id).gte("received_at", f"{date_from}T00:00:00Z").lte("received_at", f"{date_to}T23:59:59Z").order("received_at", desc=True).limit(limit).execute()
     return res.data
 
 def q_top_senders(client_id: str, date_from: str, date_to: str, limit: int = 5) -> list[dict]:
@@ -551,10 +552,8 @@ def q_top_senders(client_id: str, date_from: str, date_to: str, limit: int = 5) 
 
 def q_unanswered_emails(client_id: str, limit: int = 20) -> list[dict]:
     db = get_client()
-    res = db.table("emails").select("*, draft_responses!left(status)").eq("client_id", client_id).order("received_at", desc=True).limit(limit).execute()
-    # Filtriamo dove non ci sono bozze o lo status non è approved/sent (cioè ignorate o nessuna/pending)
-    unanswered = [r for r in res.data if not r.get("draft_responses") or all(d.get("status") not in ("approved", "sent") for d in r["draft_responses"])]
-    return unanswered[:limit]
+    res = db.table("v_unanswered_emails").select("*").eq("client_id", client_id).order("received_at", desc=True).limit(limit).execute()
+    return res.data
 
 def q_drafts_by_status(client_id: str, status: str, limit: int = 20) -> list[dict]:
     db = get_client()

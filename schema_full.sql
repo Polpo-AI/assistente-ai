@@ -119,7 +119,6 @@ create table if not exists emails (
     body                    text,
     attachments             jsonb default '[]',
     received_at             timestamptz default now(),
-    raw_headers             jsonb,
     
     -- Enrichments (v10)
     quoted_text             text default '',
@@ -264,6 +263,24 @@ left join draft_responses dr       on dr.email_id = e.id
 order by e.received_at desc;
 
 -- ─────────────────────────────────────────────
+-- VIEW — Unanswered Emails
+-- ─────────────────────────────────────────────
+create or replace view v_unanswered_emails as
+select
+    e.id,
+    e.client_id,
+    e.received_at,
+    e.sender_email,
+    e.sender_name,
+    e.subject,
+    substring(e.body from 1 for 150) as body_excerpt,
+    dr.status as draft_status
+from emails e
+left join draft_responses dr on dr.email_id = e.id
+where e.direction = 'inbound'
+  and (dr.id is null or dr.status not in ('approved', 'sent'));
+
+-- ─────────────────────────────────────────────
 -- RPC DASHBOARD (Raggruppamenti su Server)
 -- ─────────────────────────────────────────────
 
@@ -309,6 +326,28 @@ begin
     left join rx r on d.day = r.day
     left join tx t on d.day = t.day
     order by d.day;
+end;
+$$ language plpgsql;
+
+-- ─────────────────────────────────────────────
+-- DATA RETENTION & CLEANUP
+-- ─────────────────────────────────────────────
+create or replace function rpc_clean_old_emails(p_days_to_keep int default 60)
+returns int as $$
+declare
+    v_cutoff timestamptz;
+    v_count int;
+begin
+    v_cutoff := now() - (p_days_to_keep || ' days')::interval;
+    
+    with deleted as (
+        delete from emails
+        where received_at < v_cutoff
+        returning id
+    )
+    select count(*) into v_count from deleted;
+    
+    return v_count;
 end;
 $$ language plpgsql;
 

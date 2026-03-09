@@ -525,17 +525,23 @@ def _update_draft_gen_status(email_id: str, status: str) -> None:
 async def _alert_draft_failed(client_id: str, email_id: str, error: str) -> None:
     """Invia alert Telegram quando la generazione bozza fallisce."""
     try:
-        db      = get_db()
-        client  = db.table("clients").select("telegram_chat_id, name").eq("id", client_id).execute()
-        if not client.data:
+        def fetch_db_data():
+            db = get_db()
+            c = db.table("clients").select("telegram_chat_id, name").eq("id", client_id).execute()
+            e = db.table("emails").select("subject, sender_email").eq("id", email_id).execute()
+            return c.data, e.data
+
+        client_data, email_data = await asyncio.to_thread(fetch_db_data)
+        
+        if not client_data:
             return
-        chat_id = client.data[0].get("telegram_chat_id")
-        name    = client.data[0].get("name", client_id)
+        chat_id = client_data[0].get("telegram_chat_id")
+        name    = client_data[0].get("name", client_id)
         if not chat_id:
             return
-        email   = db.table("emails").select("subject, sender_email").eq("id", email_id).execute()
-        subject = email.data[0].get("subject", "—") if email.data else "—"
-        sender  = email.data[0].get("sender_email", "—") if email.data else "—"
+            
+        subject = email_data[0].get("subject", "—") if email_data else "—"
+        sender  = email_data[0].get("sender_email", "—") if email_data else "—"
         msg = (
             f"⚠️ *Generazione bozza fallita* — {name}\n\n"
             f"Da: `{sender}`\n"
@@ -651,8 +657,8 @@ async def process_email(client_id: str, email_data: dict) -> None:
     if result.priority == 0 or result.intent == "spam":
         logger.info("worker.process | [%s] Priorità 0 / spam (%s) — nessuna risposta",
                     client_name, result.intent)
-        mark_email_no_reply(email_id, result.summary)
-        _update_draft_gen_status(email_id, "skipped")
+        await asyncio.to_thread(mark_email_no_reply, email_id, result.summary)
+        await asyncio.to_thread(_update_draft_gen_status, email_id, "skipped")
         return
 
     # 4. Genera bozza con Sonnet
@@ -662,18 +668,18 @@ async def process_email(client_id: str, email_data: dict) -> None:
     except Exception as e:
         err = str(e)
         logger.error("worker.process | [%s] Eccezione generazione bozza: %s", client_name, err)
-        mark_draft_generation_failed(email_id, err)
+        await asyncio.to_thread(mark_draft_generation_failed, email_id, err)
         await _alert_draft_failed(client_id, email_id, err)
         return
 
     if not draft:
         err = "generate_response_draft ha restituito None"
         logger.error("worker.process | [%s] %s (email %s)", client_name, err, email_id)
-        mark_draft_generation_failed(email_id, err)
+        await asyncio.to_thread(mark_draft_generation_failed, email_id, err)
         await _alert_draft_failed(client_id, email_id, err)
         return
 
-    _update_draft_gen_status(email_id, "done")
+    await asyncio.to_thread(_update_draft_gen_status, email_id, "done")
     logger.info("worker.process | [%s] Bozza pronta → draft_id=%s", client_name, draft.draft_id)
 
     # 5. Notifica Telegram per email importanti (Priority 2 e 3)
@@ -704,7 +710,7 @@ async def _send_email_smtp_inner(draft: dict) -> None:
 
     if not to_address or not from_email:
         logger.error("worker.smtp | draft %s — dati mancanti", draft_id)
-        mark_draft_failed(draft_id, "Dati mittente/destinatario mancanti")
+        await asyncio.to_thread(mark_draft_failed, draft_id, "Dati mittente/destinatario mancanti")
         return
 
     # Message-ID generato da noi → controllo totale, salviamo subito
@@ -740,12 +746,13 @@ async def _send_email_smtp_inner(draft: dict) -> None:
         )
 
         # Aggiorna draft con sent_message_id
-        mark_draft_sent(draft_id, sent_message_id)
+        await asyncio.to_thread(mark_draft_sent, draft_id, sent_message_id)
         logger.info("worker.smtp | ✓ Inviata → draft=%s a <%s> msg_id=%s",
                     draft_id, to_address, sent_message_id)
 
         # Salva email outbound nel DB per threading completo
-        save_outbound_email(
+        await asyncio.to_thread(
+            save_outbound_email,
             client_id=client_id,
             draft_id=draft_id,
             sent_message_id=sent_message_id,
@@ -767,7 +774,7 @@ async def _send_email_smtp_inner(draft: dict) -> None:
     except Exception as e:
         err = str(e)
         logger.error("worker.smtp | ✗ Fallita → draft=%s: %s", draft_id, err)
-        mark_draft_failed(draft_id, err)
+        await asyncio.to_thread(mark_draft_failed, draft_id, err)
 
         tg_msg_id  = draft.get("telegram_message_id")
         tg_chat_id = client_smtp.get("telegram_chat_id")
@@ -798,22 +805,31 @@ async def _process_client_imap(client: dict, global_max_uid: dict) -> None:
             return
 
         max_uid = int(client.get("imap_last_uid") or 0)
+        
+        async def _safe_process(edata):
+            try:
+                await process_email(client_id, edata)
+            except Exception as inner_e:
+                logger.error(
+                    "worker.imap | [%s] Errore UID %s: %s — verrà ritentata al prossimo ciclo",
+                    client_name, edata.get("uid"), inner_e
+                )
+
+        tasks = []
         for email_data in new_emails:
             email_data["_client_name"] = client_name
             if email_data.get("_skip"):
                 max_uid = max(max_uid, email_data["uid"])
                 continue
-            try:
-                await process_email(client_id, email_data)
-                max_uid = max(max_uid, email_data["uid"])
-            except Exception as inner_e:
-                logger.error(
-                    "worker.imap | [%s] Errore UID %s: %s — verrà ritentata al prossimo ciclo",
-                    client_name, email_data.get("uid"), inner_e
-                )
+                
+            tasks.append(_safe_process(email_data))
+            max_uid = max(max_uid, email_data["uid"])
+
+        if tasks:
+            await asyncio.gather(*tasks)
 
         if max_uid > int(client.get("imap_last_uid") or 0):
-            update_last_uid(client_id, max_uid)
+            await asyncio.to_thread(update_last_uid, client_id, max_uid)
 
     except Exception as e:
         logger.error("worker.imap | [%s] Errore ciclo: %s", client_name, e)
@@ -824,7 +840,7 @@ async def imap_polling_loop() -> None:
 
     while True:
         try:
-            clients = get_active_clients_with_email()
+            clients = await asyncio.to_thread(get_active_clients_with_email)
             if clients:
                 # Tutti i clienti in parallelo — nessuno aspetta l'altro
                 await asyncio.gather(
@@ -846,7 +862,7 @@ async def approved_watcher_loop() -> None:
 
     while True:
         try:
-            approved = get_approved_drafts()
+            approved = await asyncio.to_thread(get_approved_drafts)
             if approved:
                 logger.info("worker.approved | %d bozze da inviare", len(approved))
                 await asyncio.gather(
