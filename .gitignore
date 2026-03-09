@@ -3,3 +3,7 @@
 __pycache__/
 *.pyc
 tecnodomous360.json
+venv/
+*.log
+*.bak
+il_mondo_dei_giochi.json
