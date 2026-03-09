@@ -387,7 +387,9 @@ def get_draft_by_id(draft_id: str) -> Optional[dict]:
     db = get_client()
     result = (
         db.table("draft_responses")
-        .select("*, emails(sender_email, sender_name, subject, body), clients(telegram_chat_id, llm_tone, signature, name)")
+        .select("*, emails(sender_email, sender_name, subject, body, message_id), "
+                "clients(telegram_chat_id, llm_tone, signature, name, "
+                "smtp_host, smtp_port, smtp_user, smtp_password)")
         .eq("id", draft_id)
         .execute()
     )
