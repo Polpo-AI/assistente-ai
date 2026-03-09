@@ -690,7 +690,8 @@ async def process_email(client_id: str, email_data: dict) -> None:
 # ─────────────────────────────────────────────
 
 async def _send_email_smtp_inner(draft: dict) -> None:
-    """Core invio SMTP — chiamato sempre dentro il semaforo."""    draft_id    = draft["id"]
+    """Core invio SMTP — chiamato sempre dentro il semaforo."""
+    draft_id    = draft["id"]
     client_id   = draft["client_id"]
     client_smtp = draft.get("clients") or {}
     email_orig  = draft.get("emails") or {}
