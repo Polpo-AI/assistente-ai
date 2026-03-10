@@ -266,7 +266,7 @@ order by e.received_at desc;
 -- VIEW — Unanswered Emails
 -- ─────────────────────────────────────────────
 create or replace view v_unanswered_emails as
-select
+select distinct on (e.id)
     e.id,
     e.client_id,
     e.received_at,
@@ -278,7 +278,8 @@ select
 from emails e
 left join draft_responses dr on dr.email_id = e.id
 where e.direction = 'inbound'
-  and (dr.id is null or dr.status not in ('approved', 'sent'));
+  and (dr.id is null or dr.status not in ('approved', 'sent'))
+order by e.id, dr.status nulls last;
 
 -- ─────────────────────────────────────────────
 -- RPC DASHBOARD (Raggruppamenti su Server)

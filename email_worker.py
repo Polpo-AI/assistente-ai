@@ -57,6 +57,39 @@ APPROVED_POLL_INTERVAL = 30
 IMAP_TIMEOUT           = 30
 SMTP_MAX_CONCURRENT    = 3  # max connessioni SMTP simultanee
 
+# Circuit breaker IMAP — evita timeout ripetuti su server down
+IMAP_CB_MAX_FAILS   = 3          # fallimenti prima di skipare
+IMAP_CB_BACKOFF_SEC = 600        # 10 minuti di pausa prima di riprovare
+_imap_circuit: dict[str, dict] = {}  # {client_id: {"fails": N, "retry_at": datetime}}
+
+def _cb_is_open(client_id: str) -> bool:
+    """Restituisce True se il circuit breaker è aperto (client skippato)."""
+    cb = _imap_circuit.get(client_id)
+    if not cb:
+        return False
+    if cb["fails"] < IMAP_CB_MAX_FAILS:
+        return False
+    if datetime.now(timezone.utc) >= cb["retry_at"]:
+        # Backoff scaduto: ripristina un tentativo
+        cb["fails"] = IMAP_CB_MAX_FAILS - 1
+        logger.info("worker.cb | [%s] Circuit breaker rimesso in prova", client_id)
+        return False
+    return True
+
+def _cb_record_fail(client_id: str, client_name: str) -> None:
+    cb = _imap_circuit.setdefault(client_id, {"fails": 0, "retry_at": None})
+    cb["fails"] += 1
+    if cb["fails"] >= IMAP_CB_MAX_FAILS:
+        from datetime import timedelta
+        cb["retry_at"] = datetime.now(timezone.utc) + timedelta(seconds=IMAP_CB_BACKOFF_SEC)
+        logger.warning(
+            "worker.cb | [%s] Circuit breaker APERTO dopo %d fallimenti — skip per %ds",
+            client_name, cb["fails"], IMAP_CB_BACKOFF_SEC
+        )
+
+def _cb_record_success(client_id: str) -> None:
+    _imap_circuit.pop(client_id, None)
+
 _smtp_semaphore: asyncio.Semaphore | None = None
 
 def _get_smtp_semaphore() -> asyncio.Semaphore:
@@ -576,26 +609,38 @@ async def process_email(client_id: str, email_data: dict) -> None:
         att_names           = ", ".join(a["filename"] for a in raw_attachments)
         body_for_classifier = f"[Email senza testo — allegati presenti: {att_names}]"
 
-    # 1. Classificazione — passa il quoted_text direttamente (sempre se presente)
-    try:
-        msg = InboundMessage(
-            sender_email=email_data["sender_email"],
-            sender_name=email_data["sender_name"],
-            subject=email_data["subject"],
-            body=body_for_classifier,
-            detected_language=email_data.get("detected_language", "unknown"),
-            in_reply_to=email_data.get("in_reply_to", ""),
-        )
+    # Costruisce il messaggio per il classificatore
+    msg = InboundMessage(
+        sender_email=email_data["sender_email"],
+        sender_name=email_data["sender_name"],
+        subject=email_data["subject"],
+        body=body_for_classifier,
+        detected_language=email_data.get("detected_language", "unknown"),
+        in_reply_to=email_data.get("in_reply_to", ""),
+    )
 
-        result = await asyncio.to_thread(
-            classify_message,
-            msg=msg,
-            client_id=client_id,
-            llm_client=anthropic_client,
-            use_real_db=True,
-            save_to_db=True,
-            quoted_text=email_data.get("quoted_text", ""),
+    # 1. Classificazione con retry automatico su errori transienti (429, 529)
+    try:
+        from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+        import anthropic as _anthropic_mod
+
+        @retry(
+            retry=retry_if_exception_type((_anthropic_mod.RateLimitError, _anthropic_mod.APIStatusError)),
+            stop=stop_after_attempt(3),
+            wait=wait_exponential(multiplier=1, min=2, max=10),
+            reraise=True,
         )
+        def _classify_with_retry():
+            return classify_message(
+                msg=msg,
+                client_id=client_id,
+                llm_client=anthropic_client,
+                use_real_db=True,
+                save_to_db=True,
+                quoted_text=email_data.get("quoted_text", ""),
+            )
+
+        result = await asyncio.to_thread(_classify_with_retry)
     except Exception as e:
         logger.error("worker.process | [%s] Errore classificazione: %s", client_name, e)
         raise
@@ -799,40 +844,73 @@ async def _process_client_imap(client: dict, global_max_uid: dict) -> None:
     """Processa le nuove email IMAP per un singolo cliente — eseguito in parallelo."""
     client_id   = client["id"]
     client_name = client.get("name", client_id)
+
+    # Circuit breaker: se il server IMAP è stato down per troppo tempo, saltiamo
+    if _cb_is_open(client_id):
+        logger.debug("worker.cb | [%s] Circuit breaker aperto — skip questo ciclo", client_name)
+        return
+
     try:
         new_emails = await fetch_new_emails_imap(client)
+        _cb_record_success(client_id)  # connessione andata a buon fine
+
         if not new_emails:
             return
 
-        max_uid = int(client.get("imap_last_uid") or 0)
-        
-        async def _safe_process(edata):
+        base_uid  = int(client.get("imap_last_uid") or 0)
+        # UID per le email di skip (bounce, vuote) — questi possiamo aggiornare subito
+        skip_uids: set[int] = set()
+        # UID per le email processate con successo
+        done_uids: set[int] = set()
+
+        async def _safe_process(edata: dict) -> None:
             try:
                 await process_email(client_id, edata)
+                done_uids.add(edata["uid"])
             except Exception as inner_e:
                 logger.error(
                     "worker.imap | [%s] Errore UID %s: %s — verrà ritentata al prossimo ciclo",
                     client_name, edata.get("uid"), inner_e
                 )
+                # Non aggiungiamo a done_uids → UID non avanzato → sarà ripresa
 
         tasks = []
         for email_data in new_emails:
             email_data["_client_name"] = client_name
             if email_data.get("_skip"):
-                max_uid = max(max_uid, email_data["uid"])
+                skip_uids.add(email_data["uid"])
                 continue
-                
             tasks.append(_safe_process(email_data))
-            max_uid = max(max_uid, email_data["uid"])
 
         if tasks:
             await asyncio.gather(*tasks)
 
-        if max_uid > int(client.get("imap_last_uid") or 0):
-            await asyncio.to_thread(update_last_uid, client_id, max_uid)
+        # Calcola il UID sicuro: il più grande tra skip e done,
+        # ma NON superiore all'UID minimo delle email che hanno fallito.
+        all_processed = skip_uids | done_uids
+        failed_uids = {
+            ed["uid"] for ed in new_emails
+            if not ed.get("_skip") and ed["uid"] not in done_uids
+        }
+
+        # Avanza l'UID solo fino al primo fallimento (conservativo e sicuro)
+        safe_max_uid = base_uid
+        for uid in sorted(all_processed):
+            if failed_uids and uid > min(failed_uids):
+                break  # non avanziamo oltre il primo gap
+            safe_max_uid = uid
+
+        if safe_max_uid > base_uid:
+            logger.info("worker.imap | [%s] Aggiorno last_uid %d → %d (%d ok, %d fallite)",
+                        client_name, base_uid, safe_max_uid, len(done_uids), len(failed_uids))
+            await asyncio.to_thread(update_last_uid, client_id, safe_max_uid)
+        elif failed_uids:
+            logger.warning("worker.imap | [%s] %d email fallite — last_uid rimane a %d per il retry",
+                           client_name, len(failed_uids), base_uid)
 
     except Exception as e:
         logger.error("worker.imap | [%s] Errore ciclo: %s", client_name, e)
+        _cb_record_fail(client_id, client_name)
 
 
 async def imap_polling_loop() -> None:
