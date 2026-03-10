@@ -598,6 +598,27 @@ async def process_email(client_id: str, email_data: dict) -> None:
       5. Notifica Telegram
     """
     client_name = email_data.get("_client_name", client_id)
+    message_id  = email_data.get("message_id", "")
+
+    # Guardia anti-duplicati: se questo message_id è già nel DB, l'email è già stata
+    # processata (es. retry dopo safe_max_uid conservativo). Saltiamo silenziosamente.
+    if message_id:
+        from database import get_client as _get_db
+        existing = await asyncio.to_thread(
+            lambda: _get_db().table("emails")
+                .select("id")
+                .eq("client_id", client_id)
+                .eq("message_id", message_id)
+                .limit(1)
+                .execute()
+        )
+        if existing.data:
+            logger.info(
+                "worker.process | [%s] message_id già presente (email_id=%s) — skip duplicato",
+                client_name, existing.data[0]["id"]
+            )
+            return
+
     logger.info("worker.process | [%s] Elaboro email da %s: %s",
                 client_name, email_data.get("sender_email"), email_data.get("subject"))
 
