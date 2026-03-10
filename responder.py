@@ -246,7 +246,8 @@ Usa [PLACEHOLDER] per dati che l'operatore deve completare.
 Non inventare prezzi, date o disponibilità reali.
 Lunghezza: max 150 parole salvo necessità.
 
-Rispondi SOLO con JSON:
+Rispondi SOLO con un oggetto JSON valido. Non aggiungere commenti o testo extra.
+JSON Schema:
 {{
   "subject": "oggetto risposta",
   "body": "corpo completo bozza",
@@ -254,25 +255,28 @@ Rispondi SOLO con JSON:
   "attach_document": null
 }}
 
-Campo 'attach_document': se l'intent è 'preventivo' E hai informazioni sufficienti per compilare un preventivo formale (voci, descrizioni, prezzi stimati), popola questo campo con:
+Campo 'attach_document': se l'intent è 'preventivo' E hai informazioni sufficienti (voci, descrizioni, prezzi), popola questo campo con un oggetto 'preventivo'.
+IMPORTANTE: Se il cliente fornisce dei prezzi nell'email, UTILIZZALI ma AUMENTALI del 10% ciascuno (arrotonda per eccesso). Se non ci sono prezzi, usa [PLACEHOLDER].
+
+Schema attach_document:
 {{
   "type": "preventivo",
   "format": "pdf",
   "data": {{
-    "oggetto": "Preventivo — [descrizione breve]",
-    "destinatario": {{"nome": "[Nome Cliente]", "email": "[email]", "riferimento": "[rif email]"}},
-    "introduzione": "[paragrafo introduttivo formale]",
+    "oggetto": "Preventivo — [descrizione]",
+    "destinatario": {{"nome": "[Nome]", "email": "[email]", "riferimento": "[rif]"}},
+    "introduzione": "[introduzione formale]",
     "voci": [
       {{"descrizione": "[voce]", "quantita": 1, "prezzo_unitario": 0.0}}
     ],
     "iva_percentuale": 22,
     "validita_giorni": 30,
-    "note": "[note garanzia o termini]",
-    "condizioni": "[condizioni di pagamento]"
+    "note": "[note]",
+    "condizioni": "[pagamento]"
   }}
 }}
-Se non hai informazioni sufficienti per un preventivo reale (prezzi, voci, quantità), lascia 'attach_document' a null.
-Non aggiungere testo fuori dal JSON."""
+Se non hai dati per un preventivo, lascia 'attach_document' a null.
+ASSICURATI che il JSON sia perfettamente formattato (usa doppie virgolette, evita virgole finali)."""
 
     user_content = f"""
 EMAIL DA GESTIRE:
@@ -291,18 +295,32 @@ ISTRUZIONI PER QUESTO INTENT ({final_intent}):
 
     response = client.messages.create(
         model=RESPONDER_MODEL,
-        max_tokens=800,
+        max_tokens=2000,
         timeout=60.0,
         system=system,
         messages=[{"role": "user", "content": user_content}]
     )
 
     raw_text = response.content[0].text.strip()
-    # Rimuove blocchi ```json ... ``` se presenti
+    # Pulizia avanzata del JSON
     import re
-    clean_json = re.sub(r"^(?:```json\n?|```\n?)", "", raw_text)
-    clean_json = re.sub(r"\n?```$", "", clean_json)
     
+    # 1. Rimuove blocchi markdown ```json ... ```
+    clean_json = re.sub(r"```(?:json)?\s*(.*?)\s*```", r"\1", raw_text, flags=re.DOTALL).strip()
+    
+    # 2. Se ancora inizia con ```, rimuovi solo l'inizio
+    clean_json = re.sub(r"^```(?:json)?", "", clean_json).strip()
+    clean_json = re.sub(r"```$", "", clean_json).strip()
+
+    # 3. Tenta di trovare il primo { e l'ultimo } se c'è testo spurio fuori
+    start_idx = clean_json.find('{')
+    end_idx = clean_json.rfind('}')
+    if start_idx != -1 and end_idx != -1:
+        clean_json = clean_json[start_idx:end_idx+1]
+
+    # 4. Rimuove trailing commas prima di chiusure di oggetti/liste (errore comune delle IA)
+    clean_json = re.sub(r",\s*([\]}])", r"\1", clean_json)
+
     try:
         data = json.loads(clean_json)
         return (
@@ -311,7 +329,10 @@ ISTRUZIONI PER QUESTO INTENT ({final_intent}):
             data.get("suggested_actions", []),
             data.get("attach_document"),  # None oppure dict con type/format/data
         )
-    except (json.JSONDecodeError, ValueError):
+    except (json.JSONDecodeError, ValueError) as e:
+        logger.error("responder | Errore Parsing JSON: %s", e)
+        logger.error("responder | RAW TEXT (first 3000 chars): %s", raw_text[:3000])
+        logger.error("responder | CLEANED TEXT: %s", clean_json)
         return (
             f"Re: {ctx.email_subject}",
             "Errore generazione bozza. Rispondere manualmente.",

@@ -363,7 +363,58 @@ def mark_draft_generation_failed(email_id: str, error: str) -> None:
         logger.error("mark_draft_generation_failed | email_id=%s: %s", email_id, e)
 
 
+def mark_draft_failed(draft_id: str, error: str) -> None:
+    """Marca una bozza come fallita (errore SMTP)."""
+    try:
+        get_client().table("draft_responses").update({
+            "status":     "send_failed",
+            "send_error": error[:500],
+        }).eq("id", draft_id).execute()
+    except Exception as e:
+        logger.error("mark_draft_failed | draft_id=%s: %s", draft_id, e)
+
+
+def save_outbound_email(
+    client_id: str,
+    draft_id: str,
+    sent_message_id: str,
+    in_reply_to: str,
+    references_ids: list,
+    sender_email: str,
+    sender_name: str,
+    recipient_email: str,
+    subject: str,
+    body: str,
+) -> None:
+    """
+    Crea un record nella tabella emails per ogni email inviata (direction='outbound').
+    Permette la ricostruzione completa del thread.
+    """
+    try:
+        get_client().table("emails").insert({
+            "client_id":      client_id,
+            "direction":      "outbound",
+            "message_id":     sent_message_id,
+            "in_reply_to":    in_reply_to,
+            "references_ids": references_ids,
+            "sender_email":   sender_email,
+            "sender_name":    sender_name,
+            "subject":        subject,
+            "body":           body,
+            "intent":         "outbound",
+            "priority":       0,
+            "classified_by":  "outbound",
+            "contact_type":   "bot",
+            "confidence":     1.0,
+            "summary":        f"Email inviata in risposta a {recipient_email}",
+        }).execute()
+        logger.info("save_outbound_email | Salvata email outbound msg_id=%s", sent_message_id)
+    except Exception as e:
+        logger.error("save_outbound_email | Errore: %s", e)
+
+
 def mark_draft_sent(draft_id: str, sent_message_id: str = "") -> dict:
+
     """Marca una bozza come inviata, salva il Message-ID SMTP generato."""
     db = get_client()
     result = db.table("draft_responses").update({

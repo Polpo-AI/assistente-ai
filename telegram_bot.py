@@ -45,7 +45,7 @@ from database import (
     get_pending_edit,
     clear_pending_edit,
 )
-from email_worker import send_email_smtp
+from smtp_sender import send_email_smtp
 from attachment_reader import extract_pending_attachment
 from responder import refine_draft
 import query_tools

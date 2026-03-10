@@ -42,6 +42,7 @@ from responder import generate_response_draft
 import telegram_bot
 from anthropic import Anthropic
 from attachment_reader import process_email_attachments
+from smtp_sender import send_email_smtp
 
 load_dotenv()
 
@@ -90,13 +91,6 @@ def _cb_record_fail(client_id: str, client_name: str) -> None:
 def _cb_record_success(client_id: str) -> None:
     _imap_circuit.pop(client_id, None)
 
-_smtp_semaphore: asyncio.Semaphore | None = None
-
-def _get_smtp_semaphore() -> asyncio.Semaphore:
-    global _smtp_semaphore
-    if _smtp_semaphore is None:
-        _smtp_semaphore = asyncio.Semaphore(SMTP_MAX_CONCURRENT)
-    return _smtp_semaphore
 
 anthropic_client = Anthropic()
 
@@ -590,13 +584,22 @@ async def _alert_draft_failed(client_id: str, email_id: str, error: str) -> None
 
 async def process_email(client_id: str, email_data: dict) -> None:
     """
-    Flusso completo:
-      1. Classificazione Haiku con contesto completo (corpo + thread)
-      2. Salva enrichments nel DB (message_id, in_reply_to, quoted_text, lingua, thread_topic)
-      3. Processa allegati con Sonnet (estrai testo, salva nel DB)
-      4. Genera bozza con Sonnet
-      5. Notifica Telegram
+    Pipeline di processamento di una singola email Inbound.
+    Inclusa la classificazione e la generazione della bozza.
     """
+    client_name = email_data.get("_client_name", client_id)
+    uid = email_data.get("uid", "?")
+    logger.info("worker.process | [%s] Inizio processamento UID %s: '%s'", 
+                client_name, uid, email_data.get("subject"))
+    
+    # 0. Setup Anthropic
+    import os
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    # 1. Classificazione Haiku con contesto completo (corpo + thread)
+    # 2. Salva enrichments nel DB (message_id, in_reply_to, quoted_text, lingua, thread_topic)
+    # 3. Processa allegati con Sonnet (estrai testo, salva nel DB)
+    # 4. Genera bozza con Sonnet
+    # 5. Notifica Telegram
     client_name = email_data.get("_client_name", client_id)
     message_id  = email_data.get("message_id", "")
 
@@ -689,6 +692,7 @@ async def process_email(client_id: str, email_data: dict) -> None:
     )
 
     # 3. Allegati — screening Haiku + estrazione Sonnet
+    att_result = None
     if raw_attachments and result.priority > 0 and result.intent != "spam":
         logger.info("worker.process | [%s] Processo %d allegato/i...",
                     client_name, len(raw_attachments))
@@ -787,156 +791,13 @@ async def process_email(client_id: str, email_data: dict) -> None:
             logger.warning("worker.process | [%s] Telegram fallito: %s", client_name, e)
 
 
-# ─────────────────────────────────────────────
-# SMTP — invio bozze approvate
-# ─────────────────────────────────────────────
-
-async def _send_email_smtp_inner(draft: dict, attachments: list[dict] | None = None) -> None:
-    """
-    Core invio SMTP — chiamato sempre dentro il semaforo.
-
-    Args:
-        draft:       record draft (con clients, emails embedded)
-        attachments: lista opzionale di {filename: str, data: bytes, mime_type: str}
-                     per allegare file generati (PDF, Excel) alla risposta
-    """
-    import email.mime.base as _mimebase
-    import email.encoders as _encoders
-
-    draft_id    = draft["id"]
-    client_id   = draft["client_id"]
-    client_smtp = draft.get("clients") or {}
-    email_orig  = draft.get("emails") or {}
-
-    to_address   = email_orig.get("sender_email", "")
-    to_name      = email_orig.get("sender_name", "")
-    subject      = draft.get("subject", "")
-    body         = draft.get("body", "")
-    from_name    = client_smtp.get("name", "")
-    from_email   = client_smtp.get("smtp_user", "")
-
-    if not to_address or not from_email:
-        logger.error("worker.smtp | draft %s — dati mancanti", draft_id)
-        await asyncio.to_thread(mark_draft_failed, draft_id, "Dati mittente/destinatario mancanti")
-        return
-
-    # Message-ID generato da noi → controllo totale, salviamo subito
-    sent_message_id       = generate_message_id(from_email)
-    original_message_id   = email_orig.get("message_id", "")
-
-    # References: aggiungi message_id originale alla catena
-    references_ids = []
-    if original_message_id:
-        references_ids = [original_message_id]
-
-    # Se ci sono allegati, switch a 'mixed' per supportarli
-    if attachments:
-        mime_msg = MIMEMultipart("mixed")
-        alt_part = MIMEMultipart("alternative")
-        alt_part.attach(MIMEText(body, "plain", "utf-8"))
-        mime_msg.attach(alt_part)
-    else:
-        mime_msg = MIMEMultipart("alternative")
-        mime_msg.attach(MIMEText(body, "plain", "utf-8"))
-
-    mime_msg["Subject"]    = subject
-    mime_msg["From"]       = f"{from_name} <{from_email}>" if from_name else from_email
-    mime_msg["To"]         = f"{to_name} <{to_address}>" if to_name else to_address
-    mime_msg["Message-ID"] = sent_message_id
-
-    if original_message_id:
-        mime_msg["In-Reply-To"] = original_message_id
-        mime_msg["References"]  = original_message_id
-
-    # Allega file (PDF/Excel generati)
-    if attachments:
-        for att in attachments:
-            part = _mimebase.MIMEBase("application", "octet-stream")
-            part.set_payload(att["data"])
-            _encoders.encode_base64(part)
-            part.add_header("Content-Disposition", "attachment",
-                            filename=att["filename"])
-            mime_msg.attach(part)
-            logger.info("worker.smtp | Allegato: %s (%d bytes)", att["filename"], len(att["data"]))
-
-    try:
-        await aiosmtplib.send(
-            mime_msg,
-            hostname=client_smtp["smtp_host"],
-            port=int(client_smtp.get("smtp_port") or 587),
-            username=client_smtp["smtp_user"],
-            password=(client_smtp["smtp_password"] or "").replace(" ", ""),
-            start_tls=True,
-            timeout=30,
-        )
-
-        # Aggiorna draft con sent_message_id
-        await asyncio.to_thread(mark_draft_sent, draft_id, sent_message_id)
-        logger.info("worker.smtp | ✓ Inviata → draft=%s a <%s> msg_id=%s",
-                    draft_id, to_address, sent_message_id)
-
-        # Salva email outbound nel DB per threading completo
-        await asyncio.to_thread(
-            save_outbound_email,
-            client_id=client_id,
-            draft_id=draft_id,
-            sent_message_id=sent_message_id,
-            in_reply_to=original_message_id,
-            references_ids=references_ids,
-            sender_email=from_email,
-            sender_name=from_name,
-            recipient_email=to_address,
-            subject=subject,
-            body=body,
-        )
-
-        # Aggiorna card Telegram
-        tg_msg_id  = draft.get("telegram_message_id")
-        tg_chat_id = client_smtp.get("telegram_chat_id")
-        if tg_msg_id and tg_chat_id:
-            await telegram_bot.update_card_sent(tg_chat_id, tg_msg_id, draft)
-
-    except Exception as e:
-        err = str(e)
-        logger.error("worker.smtp | ✗ Fallita → draft=%s: %s", draft_id, err)
-        await asyncio.to_thread(mark_draft_failed, draft_id, err)
-
-        tg_msg_id  = draft.get("telegram_message_id")
-        tg_chat_id = client_smtp.get("telegram_chat_id")
-        if tg_msg_id and tg_chat_id:
-            await telegram_bot.update_card_failed(tg_chat_id, tg_msg_id, draft, err)
-
-
-async def send_email_smtp(draft: dict) -> None:
-    """
-    Invia una bozza approvata via SMTP.
-    Limita le connessioni simultanee a SMTP_MAX_CONCURRENT tramite semaforo.
-    Recupera automaticamente l'allegato generato (PDF/Excel) dal DB se presente.
-    """
-    import base64
-    attachments: list[dict] | None = None
-
-    # Recupera l'allegato generato dal DB (se presente)
-    att_filename = draft.get("attachment_filename")
-    att_data_b64 = draft.get("attachment_data")
-    if att_filename and att_data_b64:
-        try:
-            att_bytes = base64.b64decode(att_data_b64)
-            attachments = [{"filename": att_filename, "data": att_bytes}]
-            logger.info("worker.smtp | Allegato da DB: %s (%d bytes)", att_filename, len(att_bytes))
-        except Exception as e:
-            logger.warning("worker.smtp | Impossibile decodificare allegato: %s", e)
-
-    async with _get_smtp_semaphore():
-        await _send_email_smtp_inner(draft, attachments=attachments)
-
 
 # ─────────────────────────────────────────────
 # LOOP 1 — IMAP Polling
 # ─────────────────────────────────────────────
 
 async def _process_client_imap(client: dict, global_max_uid: dict) -> None:
-    """Processa le nuove email IMAP per un singolo cliente — eseguito in parallelo."""
+    """Processa le nuove email IMAP per un singolo cliente - eseguito in parallelo."""
     client_id   = client["id"]
     client_name = client.get("name", client_id)
 
