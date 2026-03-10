@@ -75,6 +75,56 @@ async def _tg_post(method: str, payload: dict) -> dict:
         return {}
 
 
+async def _tg_upload(method: str, field: str, filename: str, data: bytes,
+                     content_type: str, extra: dict | None = None) -> dict:
+    """
+    Carica un file binario via multipart/form-data (per sendPhoto, sendDocument).
+    """
+    try:
+        async with httpx.AsyncClient() as client:
+            files  = {field: (filename, data, content_type)}
+            params = extra or {}
+            r = await client.post(
+                f"{TELEGRAM_API}/{method}",
+                files=files,
+                data=params,
+                timeout=30.0,
+            )
+            r.raise_for_status()
+            return r.json()
+    except Exception as e:
+        logger.error("telegram | %s upload fallito: %s", method, e)
+        return {}
+
+
+async def send_photo_preview(chat_id: str, data: bytes, caption: str = "") -> None:
+    """
+    Invia una foto + didascalia su Telegram.
+    Usata per mostrare le immagini allegate dai clienti.
+    """
+    await _tg_upload(
+        "sendPhoto", "photo", "photo.jpg", data, "image/jpeg",
+        extra={"chat_id": chat_id, "caption": caption, "parse_mode": "Markdown"}
+    )
+
+
+async def send_document_preview(chat_id: str, data: bytes, filename: str,
+                                caption: str = "") -> dict:
+    """
+    Invia un documento (PDF/Excel) su Telegram.
+    Usata sia per preview allegati ricevuti che per preview PDF generati.
+    Restituisce la risposta Telegram (per salvare il file_id se necessario).
+    """
+    content_type = (
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        if filename.endswith(".xlsx") else "application/pdf"
+    )
+    return await _tg_upload(
+        "sendDocument", "document", filename, data, content_type,
+        extra={"chat_id": chat_id, "caption": caption, "parse_mode": "Markdown"}
+    )
+
+
 def _build_buttons(draft_id: str) -> dict:
     """Griglia 2x2 con i 4 bottoni inline."""
     return {
@@ -107,10 +157,19 @@ def _format_message(draft: dict) -> str:
 # Notifica push quando arriva una nuova bozza
 # ─────────────────────────────────────────────
 
-async def notify_draft(draft_id: str) -> None:
+async def notify_draft(
+    draft_id:       str,
+    inbound_photos: list[dict] | None = None,
+    inbound_docs:   list[dict] | None = None,
+) -> None:
     """
     Invia il messaggio Telegram al tenant corretto.
-    Chiamato da main.py dopo la classificazione (priority >= 2).
+    Se presenti, invia anche preview multimediali degli allegati ricevuti.
+
+    Args:
+        draft_id:       ID della bozza generata
+        inbound_photos: lista di {filename, data: bytes, description: str} — foto ricevute
+        inbound_docs:   lista di {filename, data: bytes, mime_type: str}   — documenti ricevuti
     """
     draft = get_draft_by_id(draft_id)
     if not draft:
@@ -123,7 +182,33 @@ async def notify_draft(draft_id: str) -> None:
         logger.info("notify_draft | draft_id=%s — nessun chat_id Telegram per questo cliente", draft_id[:8])
         return
 
+    # 1. Invia prima le preview degli allegati ricevuti (foto e documenti)
+    if inbound_photos:
+        for photo in inbound_photos:
+            try:
+                cap = f"📷 *Foto allegata dal cliente*\n`{photo.get('filename','')}`"
+                if photo.get('description'):
+                    cap += f"\n\n🤖 _Claude:_ {photo['description'][:300]}"
+                await send_photo_preview(chat_id, photo["data"], caption=cap)
+            except Exception as e:
+                logger.warning("notify_draft | preview foto fallita: %s", e)
+
+    if inbound_docs:
+        for doc in inbound_docs:
+            try:
+                cap = f"📎 *Documento allegato dal cliente*\n`{doc.get('filename','')}`"
+                await send_document_preview(chat_id, doc["data"], doc["filename"], caption=cap)
+            except Exception as e:
+                logger.warning("notify_draft | preview doc fallita: %s", e)
+
+    # 2. Invia la card principale con la bozza
     text = _format_message(draft)
+
+    # Aggiunge nota allegati
+    n_att = len(inbound_photos or []) + len(inbound_docs or [])
+    if n_att:
+        text += f"\n\n📎 *{n_att} allegato/i inviato/i sopra per revisione*"
+
     res = await _tg_post("sendMessage", {
         "chat_id":    chat_id,
         "text":       text,

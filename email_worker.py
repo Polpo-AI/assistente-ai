@@ -730,7 +730,38 @@ async def process_email(client_id: str, email_data: dict) -> None:
     # 5. Notifica Telegram per email importanti (Priority 2 e 3)
     if result.priority >= 2 and draft.draft_id:
         try:
-            await telegram_bot.notify_draft(draft.draft_id)
+            # Prepara preview allegati per Telegram
+            inbound_photos: list[dict] = []
+            inbound_docs: list[dict] = []
+
+            if att_result:
+                att_text = att_result.get("extracted", {})
+
+                for att in raw_attachments:
+                    fname = att.get("filename", "")
+                    data  = att.get("data", b"")
+                    mime  = att.get("mime_type", "").lower()
+                    ext   = fname.lower().split(".")[-1] if "." in fname else ""
+                    if not data:
+                        continue
+                    if mime.startswith("image/") or ext in ("jpg", "jpeg", "png", "webp", "gif"):
+                        inbound_photos.append({
+                            "filename":    fname,
+                            "data":        data,
+                            "description": att_text.get(fname, ""),
+                        })
+                    elif ext in ("pdf", "docx", "xlsx", "xls", "txt"):
+                        inbound_docs.append({
+                            "filename": fname,
+                            "data":     data,
+                            "mime_type": mime,
+                        })
+
+            await telegram_bot.notify_draft(
+                draft.draft_id,
+                inbound_photos=inbound_photos or None,
+                inbound_docs=inbound_docs or None,
+            )
         except Exception as e:
             logger.warning("worker.process | [%s] Telegram fallito: %s", client_name, e)
 
@@ -739,8 +770,18 @@ async def process_email(client_id: str, email_data: dict) -> None:
 # SMTP — invio bozze approvate
 # ─────────────────────────────────────────────
 
-async def _send_email_smtp_inner(draft: dict) -> None:
-    """Core invio SMTP — chiamato sempre dentro il semaforo."""
+async def _send_email_smtp_inner(draft: dict, attachments: list[dict] | None = None) -> None:
+    """
+    Core invio SMTP — chiamato sempre dentro il semaforo.
+
+    Args:
+        draft:       record draft (con clients, emails embedded)
+        attachments: lista opzionale di {filename: str, data: bytes, mime_type: str}
+                     per allegare file generati (PDF, Excel) alla risposta
+    """
+    import email.mime.base as _mimebase
+    import email.encoders as _encoders
+
     draft_id    = draft["id"]
     client_id   = draft["client_id"]
     client_smtp = draft.get("clients") or {}
@@ -767,17 +808,35 @@ async def _send_email_smtp_inner(draft: dict) -> None:
     if original_message_id:
         references_ids = [original_message_id]
 
-    mime_msg             = MIMEMultipart("alternative")
-    mime_msg["Subject"]  = subject
-    mime_msg["From"]     = f"{from_name} <{from_email}>" if from_name else from_email
-    mime_msg["To"]       = f"{to_name} <{to_address}>" if to_name else to_address
+    # Se ci sono allegati, switch a 'mixed' per supportarli
+    if attachments:
+        mime_msg = MIMEMultipart("mixed")
+        alt_part = MIMEMultipart("alternative")
+        alt_part.attach(MIMEText(body, "plain", "utf-8"))
+        mime_msg.attach(alt_part)
+    else:
+        mime_msg = MIMEMultipart("alternative")
+        mime_msg.attach(MIMEText(body, "plain", "utf-8"))
+
+    mime_msg["Subject"]    = subject
+    mime_msg["From"]       = f"{from_name} <{from_email}>" if from_name else from_email
+    mime_msg["To"]         = f"{to_name} <{to_address}>" if to_name else to_address
     mime_msg["Message-ID"] = sent_message_id
 
     if original_message_id:
         mime_msg["In-Reply-To"] = original_message_id
         mime_msg["References"]  = original_message_id
 
-    mime_msg.attach(MIMEText(body, "plain", "utf-8"))
+    # Allega file (PDF/Excel generati)
+    if attachments:
+        for att in attachments:
+            part = _mimebase.MIMEBase("application", "octet-stream")
+            part.set_payload(att["data"])
+            _encoders.encode_base64(part)
+            part.add_header("Content-Disposition", "attachment",
+                            filename=att["filename"])
+            mime_msg.attach(part)
+            logger.info("worker.smtp | Allegato: %s (%d bytes)", att["filename"], len(att["data"]))
 
     try:
         await aiosmtplib.send(
