@@ -143,9 +143,9 @@ SMTP Host: smtp.register.it     Porta: 587
 ### 4.1 — Tipi di Email (Intenti)
 Quali sono i motivi principali per cui i clienti scrivono?
 
-**Intenti suggeriti:** Preventivo · Appuntamento · Informazione · Reclamo · Pagamento · Spam
+**Intenti suggeriti:** Preventivo (con PDF automatico) · Appuntamento · Informazione · Reclamo · Pagamento · Spam
 
-Il cliente può aggiungere intenti personalizzati per il proprio settore.
+Il sistema può generare automaticamente documenti PDF formali (preventivi, conferme d'ordine) basandosi sui listini prezzi configurati.
 
 ### 4.2 — Priorità e Azioni
 

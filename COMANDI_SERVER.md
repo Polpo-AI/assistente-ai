@@ -1,120 +1,90 @@
-# 🖥️ Guida Comandi Server — Polpo AI
+# 🖥️ Guida Comandi Server — Polpo AI (v3 Systemd)
 
 ## Connettersi al server
 ```bash
 ssh root@46.225.212.159
-cd /opt/polpo-ai && source venv/bin/activate
+```
+Le cartelle di lavoro sono:
+- Produzione: `/opt/polpo-ai` (branch `main`)
+- Staging: `/opt/polpo-staging` (branch `preview`)
+
+---
+
+## Gestione Servizi (Systemd)
+
+Il sistema utilizza `systemd` per garantire che i processi siano sempre attivi e si riavviino in caso di crash.
+
+### Nomi dei Servizi
+- **Produzione**: `polpo-prod.service` & `polpo-worker.service`
+- **Staging**: `polpo-staging.service` & `polpo-worker-staging.service`
+
+### Comandi Comuni
+Sostituisci `<servizio>` con uno dei nomi sopra (es. `polpo-worker`).
+
+| Azione | Comando |
+|---|---|
+| Riavviare | `systemctl restart <servizio>` |
+| Avviare | `systemctl start <servizio>` |
+| Fermare | `systemctl stop <servizio>` |
+| Stato | `systemctl status <servizio>` |
+| Riavviare Tutti | `systemctl restart polpo-*` |
+
+---
+
+## Visualizzazione Log (Journalctl)
+
+I log non sono più in file `.log` sparsi, ma gestiti dal sistema.
+
+### Log in tempo reale (Follow)
+```bash
+journalctl -u polpo-worker -f
+```
+
+### Log recenti (Ultime 100 righe)
+```bash
+journalctl -u polpo-worker -n 100 --no-pager
+```
+
+### Log di una fascia oraria specifica
+```bash
+journalctl -u polpo-worker --since "15:00:00"
 ```
 
 ---
 
-## Gestione Worker
+## Deploy Aggiornamenti
 
-### Avviare il worker (in background, sopravvive alla chiusura del terminale)
+### Produzione
 ```bash
-nohup python email_worker.py > /opt/polpo-ai/worker.log 2>&1 &
+cd /opt/polpo-ai
+git fetch origin main && git reset --hard origin/main
+systemctl restart polpo-prod polpo-worker
 ```
 
-### Riavviare il worker (kill + pulizia lock + start)
+### Staging
 ```bash
-pkill -f email_worker.py; rm -f /tmp/polpo_email_worker.lock && sleep 1 && nohup python email_worker.py > /opt/polpo-ai/worker.log 2>&1 &
-```
-
-### Verificare se il worker sta girando
-```bash
-ps aux | grep email_worker
-```
-Se vedi una riga con `/opt/polpo-ai/venv/bin/python email_worker.py` → sta girando.
-Se vedi solo la riga `grep` → non sta girando.
-
-### Vedere i log in tempo reale
-```bash
-tail -f /opt/polpo-ai/worker.log
-```
-Premi `Ctrl+C` per uscire dal log (il worker continua a girare).
-
-### Killare il worker
-```bash
-pkill -f email_worker.py
-```
-
-### Lock file bloccato (worker non parte)
-```bash
-rm -f /tmp/polpo_email_worker.lock
+cd /opt/polpo-staging
+git fetch origin preview && git reset --hard origin/preview
+systemctl restart polpo-staging polpo-worker-staging
 ```
 
 ---
 
-## Deploy aggiornamenti
+## Diagnostica Rapida
 
-### Flusso completo (da fare ogni volta che puschi su GitHub)
+### Controllare se i processi sono attivi
 ```bash
-pkill -f email_worker.py; rm -f /tmp/polpo_email_worker.lock && git pull && nohup python email_worker.py > /opt/polpo-ai/worker.log 2>&1 &
+systemctl list-units "polpo-*"
 ```
 
-### Solo aggiornare il codice senza riavviare
+### Verificare l'uso delle risorse
 ```bash
-git pull
-```
-
----
-
-## Diagnostica
-
-### Controllare l'ultimo UID processato
-```bash
-python3 -c "
-from database import get_client
-db = get_client()
-r = db.table('clients').select('imap_last_uid').eq('id', 'e15d59d6-24ec-44df-bc20-fe05a9dce8ba').execute()
-print('imap_last_uid:', r.data[0]['imap_last_uid'])
-"
-```
-
-### Vedere l'ultima email salvata nel DB
-```bash
-python3 -c "
-from database import get_client
-db = get_client()
-r = db.table('emails').select('sender_email, subject').order('received_at', desc=True).limit(1).execute()
-print(r.data[0])
-"
-```
-
-### Testare il login IMAP manualmente
-```bash
-python3 -c "
-import asyncio, aioimaplib
-async def test():
-    imap = aioimaplib.IMAP4_SSL('imap.gmail.com', 993)
-    await imap.wait_hello_from_server()
-    result = await imap.login('dcdavi9@gmail.com', 'PASSWORD_SENZA_SPAZI')
-    print('Login:', result)
-asyncio.run(test())
-"
+htop
 ```
 
 ---
 
-## Stato salute server
-
-### Risorse sistema
-```bash
-htop        # CPU e RAM in tempo reale (esci con q)
-df -h       # spazio disco
-free -h     # memoria RAM
-```
-
-### Processi attivi
-```bash
-ps aux | grep python    # tutti i processi Python
-```
-
----
-
-## Note importanti
-
-- **Password Gmail app**: vanno salvate nel DB con spazi (`kwxb aeom gpse erjv`), il codice le sanitizza automaticamente prima del login.
-- **Lock file**: `/tmp/polpo_email_worker.lock` — viene creato all'avvio e rimosso allo stop. Se il worker crasha senza pulizia, va rimosso manualmente.
-- **Log file**: `/opt/polpo-ai/worker.log` — viene sovrascritto ad ogni riavvio del worker.
-- **imap_last_uid**: salvato nel DB nella tabella `clients`. Se si azzera o si abbassa, il worker riprocessa le email vecchie.
+## Note Tecniche
+- **Virtualenv**: Ogni ambiente ha il suo venv in `venv/`.
+- **IMAP Last UID**: Salvato nel database Supabase. Abbassarlo per forzare un re-scan.
+- **Locking**: Gestito internamente tramite database e flag di stato, non più tramite file `/tmp/`.
