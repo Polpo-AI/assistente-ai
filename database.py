@@ -631,7 +631,7 @@ def set_pending_edit(chat_id: str, draft_id: str, client_id: Optional[str] = Non
     db.table("chat_history").insert({
         "client_id": client_id,
         "chat_id":   str(chat_id),
-        "role":      "system",
+        "role":      "assistant",  # 'system' non permesso dal constraint live — _type nel content identifica il record
         "content":   {"_type": "pending_edit", "draft_id": draft_id},
     }).execute()
 
