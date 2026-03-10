@@ -166,15 +166,25 @@ create table if not exists draft_responses (
     reclassified        boolean default false,
     warning             text,
     status              text default 'pending'
-                            check (status in ('pending','approved','rejected','sent','ignored')),
+                            check (status in ('pending','approved','rejected','sent','ignored','snoozed','send_failed')),
     send_error          text,
     telegram_message_id bigint,
     sent_message_id     text default '',
     approved_by         text,
     approved_at         timestamptz,
     sent_at             timestamptz,
+    -- Documento generato da allegare all'email di risposta
+    attachment_filename text    default null,
+    attachment_data     bytea   default null,
     created_at          timestamptz default now()
 );
+-- Migration: aggiorna colonne se già esiste la tabella
+alter table draft_responses add column if not exists attachment_filename text    default null;
+alter table draft_responses add column if not exists attachment_data     bytea   default null;
+-- Aggiorna constraint status per includere snoozed e send_failed
+alter table draft_responses drop constraint if exists draft_responses_status_check;
+alter table draft_responses add  constraint draft_responses_status_check
+    check (status in ('pending','approved','rejected','sent','ignored','snoozed','send_failed'));
 
 -- ─────────────────────────────────────────────
 -- CHAT HISTORY — Operatore Assistente Bot

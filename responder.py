@@ -250,8 +250,28 @@ Rispondi SOLO con JSON:
 {{
   "subject": "oggetto risposta",
   "body": "corpo completo bozza",
-  "suggested_actions": ["azione 1", "azione 2"]
+  "suggested_actions": ["azione 1", "azione 2"],
+  "attach_document": null
 }}
+
+Campo 'attach_document': se l'intent è 'preventivo' E hai informazioni sufficienti per compilare un preventivo formale (voci, descrizioni, prezzi stimati), popola questo campo con:
+{{
+  "type": "preventivo",
+  "format": "pdf",
+  "data": {{
+    "oggetto": "Preventivo — [descrizione breve]",
+    "destinatario": {{"nome": "[Nome Cliente]", "email": "[email]", "riferimento": "[rif email]"}},
+    "introduzione": "[paragrafo introduttivo formale]",
+    "voci": [
+      {{"descrizione": "[voce]", "quantita": 1, "prezzo_unitario": 0.0}}
+    ],
+    "iva_percentuale": 22,
+    "validita_giorni": 30,
+    "note": "[note garanzia o termini]",
+    "condizioni": "[condizioni di pagamento]"
+  }}
+}}
+Se non hai informazioni sufficienti per un preventivo reale (prezzi, voci, quantità), lascia 'attach_document' a null.
 Non aggiungere testo fuori dal JSON."""
 
     user_content = f"""
@@ -289,12 +309,14 @@ ISTRUZIONI PER QUESTO INTENT ({final_intent}):
             data.get("subject", f"Re: {ctx.email_subject}"),
             data.get("body", ""),
             data.get("suggested_actions", []),
+            data.get("attach_document"),  # None oppure dict con type/format/data
         )
     except (json.JSONDecodeError, ValueError):
         return (
             f"Re: {ctx.email_subject}",
             "Errore generazione bozza. Rispondere manualmente.",
             ["Rispondere manualmente a questa email"],
+            None,
         )
 
 
@@ -370,11 +392,38 @@ def generate_response_draft(
             warning=None,
         )
 
-    subject, body, actions = generate_draft(ctx, config, final_intent, client)
+    subject, body, actions, attach_doc = generate_draft(ctx, config, final_intent, client)
     if final_intent == "reclamo":
         actions.insert(0, "⚠️ Reclamo: revisionare con attenzione prima dell'invio")
 
-    # ── Step 4: Salva bozza nel DB ────────────────────
+    # ── Step 4: Genera documento allegato se richiesto ──
+    attachment_bytes: bytes | None = None
+    attachment_filename: str | None = None
+
+    if attach_doc and isinstance(attach_doc, dict):
+        try:
+            from document_generator import generate_document
+            client_info = {
+                "name":      config.name,
+                "sector":    config.sector,
+                "signature": config.signature,
+            }
+            doc_type   = attach_doc.get("type", "comunicazione")
+            doc_format = attach_doc.get("format", "pdf")
+            doc_data   = attach_doc.get("data", {})
+
+            attachment_bytes, attachment_filename = generate_document(
+                format=doc_format, doc_type=doc_type,
+                data=doc_data, client_info=client_info,
+            )
+            logger.info("responder | email_id=%s documento generato: %s (%d bytes)",
+                        email_id[:8], attachment_filename, len(attachment_bytes))
+        except Exception as e:
+            logger.error("responder | email_id=%s errore generazione documento: %s", email_id[:8], e)
+            attachment_bytes = None
+            attachment_filename = None
+
+    # ── Step 5: Salva bozza nel DB ────────────────────
     draft_status = "pending"
     approved_by = None
     if ctx.priority == 1:
@@ -383,6 +432,27 @@ def generate_response_draft(
 
     draft_id = None
     try:
+        from database import get_client as _get_db
+        import base64
+        draft_payload: dict = {
+            "email_id":          email_id,
+            "client_id":         ctx.client_id,
+            "subject":           subject,
+            "body":              body,
+            "suggested_actions": actions,
+            "final_intent":      final_intent,
+            "reclassified":      reclassified,
+            "warning":           warning,
+            "status":            draft_status,
+            "approved_by":       approved_by,
+        }
+        if attachment_filename:
+            draft_payload["attachment_filename"] = attachment_filename
+        if attachment_bytes:
+            # Supabase non supporta bytea via REST — salviamo base64 nel campo text
+            # Al momento dell'invio lo decodifichiamo
+            draft_payload["attachment_data"] = base64.b64encode(attachment_bytes).decode()
+
         draft_record = save_draft(
             email_id=email_id,
             client_id=ctx.client_id,
@@ -396,8 +466,17 @@ def generate_response_draft(
             approved_by=approved_by,
         )
         draft_id = draft_record["id"]
-        logger.info("responder | email_id=%s draft_id=%s salvato — intent=%s",
-                    email_id[:8], draft_id[:8], final_intent)
+
+        # Salva attachment separatamente se presente
+        if attachment_filename and attachment_bytes:
+            _get_db().table("draft_responses").update({
+                "attachment_filename": attachment_filename,
+                "attachment_data":     base64.b64encode(attachment_bytes).decode(),
+            }).eq("id", draft_id).execute()
+
+        logger.info("responder | email_id=%s draft_id=%s salvato — intent=%s%s",
+                    email_id[:8], draft_id[:8], final_intent,
+                    f" + {attachment_filename}" if attachment_filename else "")
     except Exception as e:
         logger.error("responder | email_id=%s errore salvataggio bozza: %s", email_id[:8], e)
 

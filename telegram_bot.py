@@ -201,7 +201,23 @@ async def notify_draft(
             except Exception as e:
                 logger.warning("notify_draft | preview doc fallita: %s", e)
 
-    # 2. Invia la card principale con la bozza
+    # 2. Se la bozza ha un documento generato, invia preview su Telegram
+    try:
+        att_filename = draft.get("attachment_filename")
+        att_data_b64 = draft.get("attachment_data")
+        if att_filename and att_data_b64:
+            import base64 as _b64
+            att_bytes = _b64.b64decode(att_data_b64)
+            cap = (
+                f"📄 *Documento allegato alla risposta*\n`{att_filename}`\n\n"
+                "Questo file verrà allegato all'email quando premi ✅ Invia."
+            )
+            await send_document_preview(chat_id, att_bytes, att_filename, caption=cap)
+            logger.info("notify_draft | draft_id=%s PDF allegato inviato come preview", draft_id[:8])
+    except Exception as e:
+        logger.warning("notify_draft | preview documento generato fallita: %s", e)
+
+    # 3. Invia la card principale con la bozza
     text = _format_message(draft)
 
     # Aggiunge nota allegati

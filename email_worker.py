@@ -911,9 +911,24 @@ async def send_email_smtp(draft: dict) -> None:
     """
     Invia una bozza approvata via SMTP.
     Limita le connessioni simultanee a SMTP_MAX_CONCURRENT tramite semaforo.
+    Recupera automaticamente l'allegato generato (PDF/Excel) dal DB se presente.
     """
+    import base64
+    attachments: list[dict] | None = None
+
+    # Recupera l'allegato generato dal DB (se presente)
+    att_filename = draft.get("attachment_filename")
+    att_data_b64 = draft.get("attachment_data")
+    if att_filename and att_data_b64:
+        try:
+            att_bytes = base64.b64decode(att_data_b64)
+            attachments = [{"filename": att_filename, "data": att_bytes}]
+            logger.info("worker.smtp | Allegato da DB: %s (%d bytes)", att_filename, len(att_bytes))
+        except Exception as e:
+            logger.warning("worker.smtp | Impossibile decodificare allegato: %s", e)
+
     async with _get_smtp_semaphore():
-        await _send_email_smtp_inner(draft)
+        await _send_email_smtp_inner(draft, attachments=attachments)
 
 
 # ─────────────────────────────────────────────
