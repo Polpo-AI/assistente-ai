@@ -6,6 +6,8 @@ from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timezone
 import database as db
 
+logger = logging.getLogger(__name__)
+
 def notify_missing_feature(client_id: str, chat_id: str, message: str, conversation_history: list = None):
     """
     Invia un'email all'admin segnalando una funzione richiesta ma non disponibile.

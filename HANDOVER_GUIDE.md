@@ -8,7 +8,7 @@ This project, **Polpo AI**, relies heavily on structured JSON and asynchronous P
 The `attach_document` field in the LLM response is very verbose. We've increased `max_tokens` to **2000** in `responder.py`. If you add more PDF features, always monitor the output for truncation (`JSONDecodeError` or "unterminated string").
 
 ### 2. Markup Logic
-The prompt in `responder.py` is configured to add a **10% markup** to all prices in quote requests. This is a hard requirement. Re-verify this logic if you modify the system prompt.
+The prompt in `responder.py` is configured to handle price requests using the client's information. Re-verify this logic if you modify the system prompt.
 
 ### 3. Cleaning Logic
 The function `clean_json` in `responder.py` is the project's "safety net." It handles:

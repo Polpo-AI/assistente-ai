@@ -256,7 +256,7 @@ JSON Schema:
 }}
 
 Campo 'attach_document': se l'intent è 'preventivo' E hai informazioni sufficienti (voci, descrizioni, prezzi), popola questo campo con un oggetto 'preventivo'.
-IMPORTANTE: Se il cliente fornisce dei prezzi nell'email, UTILIZZALI ma AUMENTALI del 10% ciascuno (arrotonda per eccesso). Se non ci sono prezzi, usa [PLACEHOLDER].
+Se non ci sono prezzi per una voce, usa [PLACEHOLDER].
 
 Schema attach_document:
 {{

@@ -15,7 +15,7 @@ The project follows a modular, asynchronous architecture designed to be lightwei
 - **JSON Payload Logic**: Generates a structured response containing:
   - `subject` and `body` (Italian/Natural Language).
   - `suggested_actions` for the human operator.
-  - `attach_document`: A structured instruction for generating PDFs with dynamic pricing (including 10% markup logic).
+  - `attach_document`: A structured instruction for generating PDFs with dynamic pricing.
 - **Robust Cleaning**: Includes a dedicated engine to sanitize and repair malformed LLM outputs.
 
 ### 3. Document Generation (`document_generator.py`)

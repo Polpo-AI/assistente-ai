@@ -340,7 +340,7 @@ async def fetch_new_emails_imap(client: dict) -> list[dict]:
 
     try:
         await imap.wait_hello_from_server()
-        imap_password = (client["imap_password"] or "").replace(" ", "")
+        imap_password = client["imap_password"] or ""
         await imap.login(client["imap_user"], imap_password)
         logger.info("worker.imap | [%s] Login effettuato", client["name"])
 

@@ -94,7 +94,7 @@ async def _send_email_smtp_inner(draft: dict, attachments: list[dict] = None) ->
             hostname=client_smtp["smtp_host"],
             port=int(client_smtp.get("smtp_port") or 587),
             username=client_smtp["smtp_user"],
-            password=(client_smtp["smtp_password"] or "").replace(" ", ""),
+            password=client_smtp["smtp_password"] or "",
             start_tls=True,
             timeout=30,
         )

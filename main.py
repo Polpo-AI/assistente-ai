@@ -156,7 +156,7 @@ async def classify(email: IncomingEmail):
         raise HTTPException(status_code=500, detail="Errore salvataggio DB")
 
     return ClassifyResponse(
-        email_id=email_id,
+        email_id=result.db_ids.get("email_id"),
         contact_type=result.contact_type,
         intent=result.intent,
         priority=result.priority,
