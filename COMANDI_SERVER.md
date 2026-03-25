@@ -6,7 +6,7 @@ ssh root@46.225.212.159
 ```
 Le cartelle di lavoro sono:
 - Produzione: `/opt/polpo-ai` (branch `main`)
-- Staging: `/opt/polpo-staging` (branch `preview`)
+- Staging: `/opt/polpo-ai-staging` (branch `preview`)
 
 ---
 
@@ -63,7 +63,7 @@ systemctl restart polpo-prod polpo-worker
 
 ### Staging
 ```bash
-cd /opt/polpo-staging
+cd /opt/polpo-ai-staging
 git fetch origin preview && git reset --hard origin/preview
 systemctl restart polpo-staging polpo-worker-staging
 ```
