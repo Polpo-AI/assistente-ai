@@ -434,13 +434,26 @@ def save_telegram_message_id(draft_id: str, message_id: int) -> None:
 
 
 def get_draft_by_id(draft_id: str) -> Optional[dict]:
-    """Recupera una bozza completa per ID (usata dai callback Telegram)."""
+    """Recupera una bozza con credenziali SMTP (usata solo per l'invio)."""
     db = get_client()
     result = (
         db.table("draft_responses")
         .select("*, emails(sender_email, sender_name, subject, body, message_id), "
                 "clients(telegram_chat_id, llm_tone, signature, name, "
                 "smtp_host, smtp_port, smtp_user, smtp_password)")
+        .eq("id", draft_id)
+        .execute()
+    )
+    return result.data[0] if result.data else None
+
+
+def get_draft_for_display(draft_id: str) -> Optional[dict]:
+    """Recupera una bozza per visualizzazione — senza credenziali SMTP."""
+    db = get_client()
+    result = (
+        db.table("draft_responses")
+        .select("*, emails(sender_email, sender_name, subject, body, message_id), "
+                "clients(telegram_chat_id, llm_tone, signature, name)")
         .eq("id", draft_id)
         .execute()
     )

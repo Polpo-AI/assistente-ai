@@ -34,6 +34,7 @@ from dotenv import load_dotenv
 
 from database import (
     get_draft_by_id,
+    get_draft_for_display,
     approve_draft,
     ignore_draft,
     save_telegram_message_id,
@@ -171,7 +172,7 @@ async def notify_draft(
         inbound_photos: lista di {filename, data: bytes, description: str} — foto ricevute
         inbound_docs:   lista di {filename, data: bytes, mime_type: str}   — documenti ricevuti
     """
-    draft = get_draft_by_id(draft_id)
+    draft = get_draft_for_display(draft_id)
     if not draft:
         logger.warning("notify_draft | draft_id=%s non trovato", draft_id[:8])
         return
@@ -648,7 +649,7 @@ async def _process_conversational_query(chat_id: str, text: str) -> None:
             if tool_use.name == "send_draft_card":
                 # Intercettiamo in locale: inviamo la card e notifichiamo Claude del successo
                 draft_id = tool_use.input.get("draft_id")
-                draft = get_draft_by_id(draft_id)
+                draft = get_draft_for_display(draft_id)
                 if draft:
                     await _tg_post("sendMessage", {
                         "chat_id": chat_id,

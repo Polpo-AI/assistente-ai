@@ -56,7 +56,27 @@ logger = logging.getLogger("polpo.worker")
 IMAP_POLL_INTERVAL     = 60
 APPROVED_POLL_INTERVAL = 30
 IMAP_TIMEOUT           = 30
-SMTP_MAX_CONCURRENT    = 3  # max connessioni SMTP simultanee
+SMTP_MAX_CONCURRENT    = 3   # max connessioni SMTP simultanee
+IMAP_MAX_CONCURRENT    = 10  # max connessioni IMAP simultanee
+
+# Semaforo per limitare connessioni IMAP parallele
+_imap_semaphore: asyncio.Semaphore | None = None
+
+def _get_imap_semaphore() -> asyncio.Semaphore:
+    global _imap_semaphore
+    if _imap_semaphore is None:
+        _imap_semaphore = asyncio.Semaphore(IMAP_MAX_CONCURRENT)
+    return _imap_semaphore
+
+# Guard in-process per deduplicazione concorrente sullo stesso message_id
+_processing_message_ids: set[str] = set()
+_processing_lock: asyncio.Lock | None = None
+
+def _get_processing_lock() -> asyncio.Lock:
+    global _processing_lock
+    if _processing_lock is None:
+        _processing_lock = asyncio.Lock()
+    return _processing_lock
 
 # Circuit breaker IMAP — evita timeout ripetuti su server down
 IMAP_CB_MAX_FAILS   = 3          # fallimenti prima di skipare
@@ -328,7 +348,12 @@ async def fetch_new_emails_imap(client: dict) -> list[dict]:
     """
     Recupera le nuove email IMAP con UID > last_uid.
     Esegue strip anti-matriosca, rilevamento lingua, parsing header thread.
+    Limita le connessioni IMAP simultanee tramite semaforo.
     """
+    async with _get_imap_semaphore():
+        return await _fetch_new_emails_imap_inner(client)
+
+async def _fetch_new_emails_imap_inner(client: dict) -> list[dict]:
     client_id       = client["id"]
     last_uid_global = int(client.get("imap_last_uid") or 0)
 
@@ -603,8 +628,8 @@ async def process_email(client_id: str, email_data: dict) -> None:
     client_name = email_data.get("_client_name", client_id)
     message_id  = email_data.get("message_id", "")
 
-    # Guardia anti-duplicati: se questo message_id è già nel DB, l'email è già stata
-    # processata (es. retry dopo safe_max_uid conservativo). Saltiamo silenziosamente.
+    # Guardia anti-duplicati (cross-cycle): se questo message_id è già nel DB,
+    # l'email è già stata processata (es. retry dopo safe_max_uid conservativo).
     if message_id:
         from database import get_client as _get_db
         existing = await asyncio.to_thread(
@@ -820,6 +845,20 @@ async def _process_client_imap(client: dict, global_max_uid: dict) -> None:
         done_uids: set[int] = set()
 
         async def _safe_process(edata: dict) -> None:
+            # Guard in-process: evita che due coroutine parallele processino
+            # lo stesso message_id nello stesso ciclo di polling.
+            msg_id = edata.get("message_id", "")
+            dedup_key = f"{client_id}:{msg_id}" if msg_id else None
+            if dedup_key:
+                async with _get_processing_lock():
+                    if dedup_key in _processing_message_ids:
+                        logger.info(
+                            "worker.imap | [%s] message_id già in elaborazione in-process — skip",
+                            client_name
+                        )
+                        skip_uids.add(edata["uid"])
+                        return
+                    _processing_message_ids.add(dedup_key)
             try:
                 await process_email(client_id, edata)
                 done_uids.add(edata["uid"])
@@ -829,6 +868,9 @@ async def _process_client_imap(client: dict, global_max_uid: dict) -> None:
                     client_name, edata.get("uid"), inner_e
                 )
                 # Non aggiungiamo a done_uids → UID non avanzato → sarà ripresa
+            finally:
+                if dedup_key:
+                    _processing_message_ids.discard(dedup_key)
 
         tasks = []
         for email_data in new_emails:
