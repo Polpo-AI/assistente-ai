@@ -126,17 +126,27 @@ async def send_document_preview(chat_id: str, data: bytes, filename: str,
     )
 
 
+class Action:
+    """Costanti per le azioni callback di Telegram — evita magic strings."""
+    INVIA          = "invia"
+    MODIFICA       = "modifica"
+    SNOOZE         = "snooze"
+    IGNORA         = "ignora"
+    LEGGI_ALLEGATO = "leggi_allegato"
+    SALTA_ALLEGATO = "salta_allegato"
+
+
 def _build_buttons(draft_id: str) -> dict:
     """Griglia 2x2 con i 4 bottoni inline."""
     return {
         "inline_keyboard": [
             [
-                {"text": "✅ Invia",           "callback_data": f"invia:{draft_id}"},
-                {"text": "✏️ Modifica",        "callback_data": f"modifica:{draft_id}"},
+                {"text": "✅ Invia",           "callback_data": f"{Action.INVIA}:{draft_id}"},
+                {"text": "✏️ Modifica",        "callback_data": f"{Action.MODIFICA}:{draft_id}"},
             ],
             [
-                {"text": "⏸ Lascia per dopo", "callback_data": f"snooze:{draft_id}"},
-                {"text": "🗑 Ignora",          "callback_data": f"ignora:{draft_id}"},
+                {"text": "⏸ Lascia per dopo", "callback_data": f"{Action.SNOOZE}:{draft_id}"},
+                {"text": "🗑 Ignora",          "callback_data": f"{Action.IGNORA}:{draft_id}"},
             ],
         ]
     }
@@ -300,8 +310,8 @@ async def ask_extract_attachment(
     )
     markup = {
         "inline_keyboard": [[
-            {"text": "\u2705 Si, leggilo", "callback_data": "leggi_allegato:" + email_id + ":" + filename},
-            {"text": "\u274c No, salta",   "callback_data": "salta_allegato:" + email_id + ":" + filename},
+            {"text": "\u2705 Si, leggilo", "callback_data": f"{Action.LEGGI_ALLEGATO}:{email_id}:{filename}"},
+            {"text": "\u274c No, salta",   "callback_data": f"{Action.SALTA_ALLEGATO}:{email_id}:{filename}"},
         ]]
     }
     await _tg_post("sendMessage", {
@@ -384,7 +394,7 @@ async def _handle_callback(cq: dict) -> None:
                     draft_id[:8], status)
         return
 
-    if action == "invia":
+    if action == Action.INVIA:
         try:
             await _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": "⏳ Invio in corso...", "show_alert": False})
             await _edit_message_with_buttons(
@@ -401,7 +411,7 @@ async def _handle_callback(cq: dict) -> None:
             await _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": "❌ Errore durante l'invio", "show_alert": True})
             logger.error("callback | errore invia: %s", e)
 
-    elif action == "ignora":
+    elif action == Action.IGNORA:
         try:
             ignore_draft(draft_id)
             await _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": "🗑 Email ignorata", "show_alert": False})
@@ -410,13 +420,13 @@ async def _handle_callback(cq: dict) -> None:
         except Exception as e:
             await _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": "❌ Errore", "show_alert": True})
 
-    elif action == "snooze":
+    elif action == Action.SNOOZE:
         await _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": "⏸ Rimandato", "show_alert": False})
         update_draft_status(draft_id, "snoozed")
         await _edit_message(chat_id, message_id, _format_message(draft) + "\n\n⏸ *Lasciato per dopo* — gestisci dalla dashboard.")
         logger.info("callback | draft_id=%s snoozed salvato su DB", draft_id[:8])
 
-    elif action == "leggi_allegato":
+    elif action == Action.LEGGI_ALLEGATO:
         parts        = raw_data.split(":", 2)
         email_id_att = parts[1] if len(parts) > 1 else ""
         filename_att = parts[2] if len(parts) > 2 else ""
@@ -443,14 +453,14 @@ async def _handle_callback(cq: dict) -> None:
             await _edit_message(chat_id, message_id, f"❌ Errore nella lettura dell'allegato.")
         return
 
-    elif action == "salta_allegato":
+    elif action == Action.SALTA_ALLEGATO:
         parts        = raw_data.split(":", 2)
         filename_att = parts[2] if len(parts) > 2 else "allegato"
         await _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": "Saltato", "show_alert": False})
         await _edit_message(chat_id, message_id, f"⏭ `{filename_att}` saltato.")
         return
 
-    elif action == "modifica":
+    elif action == Action.MODIFICA:
         await _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": "✏️ Modalità modifica", "show_alert": False})
         # Opt 3: passa client_id già disponibile dalla draft — evita query extra in set_pending_edit
         set_pending_edit(str(chat_id), draft_id, client_id=draft.get("client_id"))

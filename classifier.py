@@ -34,6 +34,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from typing import Optional
+from pydantic import BaseModel, field_validator, ValidationError
 from anthropic import Anthropic
 import anthropic
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
@@ -45,6 +46,28 @@ from attachment_reader import get_quoted_text_from_db
 
 load_dotenv()
 logger = logging.getLogger("polpo.classifier")
+
+
+# ─────────────────────────────────────────────
+# Schema Pydantic per validazione output LLM
+# ─────────────────────────────────────────────
+
+class _ClassifyPayload(BaseModel):
+    intent: str = "altro"
+    priority: int = 2
+    confidence: float = 0.5
+    summary: str = ""
+    estimated_value: Optional[float] = None
+
+    @field_validator("priority")
+    @classmethod
+    def clamp_priority(cls, v: int) -> int:
+        return max(0, min(3, v))
+
+    @field_validator("confidence")
+    @classmethod
+    def clamp_confidence(cls, v: float) -> float:
+        return max(0.0, min(1.0, v))
 
 
 # ─────────────────────────────────────────────
@@ -245,24 +268,26 @@ Allegati: {att_names}{contact_block}
         json_match = re.search(r"\{.*\}", raw, re.DOTALL)
         data       = json.loads(json_match.group(0) if json_match else raw)
 
-        intent = data.get("intent", "altro")
+        payload = _ClassifyPayload.model_validate(data)
+
+        intent = payload.intent
         if intent not in config.intent_list and intent != "spam":
             intent = "altro"
 
         result = ClassificationResult(
             contact_type="sconosciuto",
             intent=intent,
-            priority=int(data.get("priority", 2)),
-            confidence=float(data.get("confidence", 0.5)),
+            priority=payload.priority,
+            confidence=payload.confidence,
             classified_by="llm",
-            summary=data.get("summary", ""),
-            estimated_value=data.get("estimated_value"),
+            summary=payload.summary,
+            estimated_value=payload.estimated_value,
         )
         logger.info("llm_classify | intent=%s conf=%.2f", result.intent, result.confidence)
         return result
 
-    except (json.JSONDecodeError, ValueError) as e:
-        logger.warning("llm_classify | JSON parsing fallito: %s | raw=%s", e, raw[:100])
+    except (json.JSONDecodeError, ValueError, ValidationError) as e:
+        logger.warning("llm_classify | parsing fallito: %s | raw=%s", e, raw[:100])
         return ClassificationResult(
             contact_type="sconosciuto", intent="altro", priority=2,
             confidence=0.3, classified_by="llm_fallback",

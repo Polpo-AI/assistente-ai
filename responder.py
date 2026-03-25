@@ -20,7 +20,8 @@ Flusso:
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
+from pydantic import BaseModel, field_validator, ValidationError
 from anthropic import Anthropic
 import anthropic
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
@@ -40,6 +41,24 @@ logger = logging.getLogger("polpo.responder")
 from models_config import RECLASSIFY_MODEL, RESPONDER_MODEL
 
 RECLASSIFY_THRESHOLD = 0.7  # Se la confidence è più bassa, usa Sonnet per riclassificare
+
+# ─────────────────────────────────────────────
+# Schema Pydantic per validazione output LLM
+# ─────────────────────────────────────────────
+
+class _DraftPayload(BaseModel):
+    subject: str = ""
+    body: str = ""
+    suggested_actions: list[str] = []
+    attach_document: Optional[Any] = None
+
+    @field_validator("suggested_actions", mode="before")
+    @classmethod
+    def coerce_actions_to_list(cls, v: Any) -> list[str]:
+        """Gestisce il caso in cui Claude restituisce una stringa invece di una lista."""
+        if isinstance(v, str):
+            return [v] if v else []
+        return v or []
 
 # ─────────────────────────────────────────────
 # Dataclasses
@@ -323,14 +342,15 @@ ISTRUZIONI PER QUESTO INTENT ({final_intent}):
 
     try:
         data = json.loads(clean_json)
+        payload = _DraftPayload.model_validate(data)
         return (
-            data.get("subject", f"Re: {ctx.email_subject}"),
-            data.get("body", ""),
-            data.get("suggested_actions", []),
-            data.get("attach_document"),  # None oppure dict con type/format/data
+            payload.subject or f"Re: {ctx.email_subject}",
+            payload.body,
+            payload.suggested_actions,
+            payload.attach_document,
         )
-    except (json.JSONDecodeError, ValueError) as e:
-        logger.error("responder | Errore Parsing JSON: %s", e)
+    except (json.JSONDecodeError, ValueError, ValidationError) as e:
+        logger.error("responder | Errore parsing JSON/validazione: %s", e)
         logger.error("responder | RAW TEXT (first 3000 chars): %s", raw_text[:3000])
         logger.error("responder | CLEANED TEXT: %s", clean_json)
         return (

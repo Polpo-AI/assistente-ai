@@ -40,8 +40,10 @@ def _now_str() -> str:
 
 
 def _doc_number() -> str:
-    """Genera un numero documento progressivo basato sul timestamp."""
-    return datetime.now().strftime("DOC-%Y%m%d-%H%M")
+    """Genera un numero documento basato su timestamp al secondo + 3 cifre random."""
+    import random
+    suffix = random.randint(100, 999)
+    return datetime.now().strftime(f"DOC-%Y%m%d-%H%M%S-{suffix}")
 
 
 # ─────────────────────────────────────────────
