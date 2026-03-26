@@ -32,7 +32,7 @@ from dotenv import load_dotenv
 
 from classifier import classify_message, InboundMessage
 from responder import generate_response_draft
-from database import get_pending_emails, approve_draft, ignore_draft
+from database import get_pending_emails, approve_draft, ignore_draft, get_email_by_id
 import telegram_bot
 
 load_dotenv()
@@ -179,7 +179,6 @@ async def create_draft(email_id: str):
 
         # Notifica Telegram se priorità >= 2
         # (Nota: di solito questo viene fatto o qui o dal worker)
-        from database import get_email_by_id
         email_data = get_email_by_id(email_id)
         if email_data and email_data.get("priority", 0) >= 2:
             await telegram_bot.notify_draft(draft.draft_id)

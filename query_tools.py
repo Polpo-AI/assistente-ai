@@ -343,12 +343,20 @@ def dispatch(tool_name: str, tool_input: dict, client_id: str, anthropic_client:
 
         elif tool_name == "generate_draft_on_demand":
             email_id = tool_input["email_id"]
-            # Richiamiamo il flusso originario per la generazione:
+            # Verifica che non esista già una bozza pending per questa email
+            existing = db.get_client().table("draft_responses") \
+                .select("id, status") \
+                .eq("email_id", email_id) \
+                .in_("status", ["pending", "approved"]) \
+                .limit(1).execute()
+            if existing.data:
+                s = existing.data[0]["status"]
+                return f"Esiste già una bozza in stato '{s}' per questa email (id={existing.data[0]['id'][:8]}). Non ne creo un'altra."
             draft = generate_response_draft(email_id, anthropic_client)
             if draft:
                 return f"Bozza generata con successo. L'ID della nuova bozza è {draft.draft_id}."
             else:
-                return "Generazione della bozza fallita o email già con bozza pending in corso."
+                return "Generazione della bozza fallita."
 
         elif tool_name == "report_unsupported_feature":
             return "OK" # Gestito esternamente in telegram_bot.py

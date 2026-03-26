@@ -61,16 +61,25 @@ logger = logging.getLogger("polpo.telegram")
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
+# Client HTTP riusato per tutte le richieste — evita overhead di connessione per request
+_http_client: httpx.AsyncClient | None = None
+
+def _get_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(timeout=15.0)
+    return _http_client
+
+
 # Helpers HTTP
 # ─────────────────────────────────────────────
 
 async def _tg_post(method: str, payload: dict) -> dict:
     """Chiama l'API Telegram in modo asincrono."""
     try:
-        async with httpx.AsyncClient() as client:
-            r = await client.post(f"{TELEGRAM_API}/{method}", json=payload, timeout=15.0)
-            r.raise_for_status()
-            return r.json()
+        r = await _get_http_client().post(f"{TELEGRAM_API}/{method}", json=payload)
+        r.raise_for_status()
+        return r.json()
     except Exception as e:
         logger.error("telegram | %s fallita: %s", method, e)
         return {}
@@ -82,17 +91,16 @@ async def _tg_upload(method: str, field: str, filename: str, data: bytes,
     Carica un file binario via multipart/form-data (per sendPhoto, sendDocument).
     """
     try:
-        async with httpx.AsyncClient() as client:
-            files  = {field: (filename, data, content_type)}
-            params = extra or {}
-            r = await client.post(
-                f"{TELEGRAM_API}/{method}",
-                files=files,
-                data=params,
-                timeout=30.0,
-            )
-            r.raise_for_status()
-            return r.json()
+        files  = {field: (filename, data, content_type)}
+        params = extra or {}
+        r = await _get_http_client().post(
+            f"{TELEGRAM_API}/{method}",
+            files=files,
+            data=params,
+            timeout=30.0,
+        )
+        r.raise_for_status()
+        return r.json()
     except Exception as e:
         logger.error("telegram | %s upload fallito: %s", method, e)
         return {}

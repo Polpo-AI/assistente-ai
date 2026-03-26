@@ -25,6 +25,7 @@ import json
 import os
 from typing import Optional
 from anthropic import Anthropic
+from db.connection import get_client as get_db
 
 logger = logging.getLogger("polpo.attachment_reader")
 
@@ -454,7 +455,6 @@ def extract_pending_attachment(
     Estrae un allegato 'pending' (>4MB) dopo conferma su Telegram.
     Legge i bytes dal DB, estrae il testo, aggiorna attachments_text.
     """
-    from database import get_client as get_db
     try:
         result = get_db().table("email_attachments_pending").select("*").eq(
             "email_id", email_id
@@ -500,7 +500,6 @@ def _save_pending_attachment(
     Salva un allegato grande in attesa di conferma Telegram.
     I bytes vengono salvati come base64 nella tabella email_attachments_pending.
     """
-    from database import get_client as get_db
     try:
         get_db().table("email_attachments_pending").upsert({
             "email_id":  email_id,
@@ -515,7 +514,6 @@ def _save_pending_attachment(
 
 def save_attachments_text(email_id: str, attachments_text: dict) -> None:
     """Salva il testo estratto degli allegati nel DB."""
-    from database import get_client as get_db
     try:
         get_db().table("emails").update({
             "attachments_text": json.dumps(attachments_text, ensure_ascii=False)
@@ -526,7 +524,6 @@ def save_attachments_text(email_id: str, attachments_text: dict) -> None:
 
 def get_attachments_text(email_id: str) -> dict:
     """Recupera il testo estratto degli allegati dal DB."""
-    from database import get_client as get_db
     try:
         result = get_db().table("emails").select("attachments_text").eq("id", email_id).execute()
         if result.data and result.data[0].get("attachments_text"):
@@ -541,7 +538,6 @@ def get_attachments_text(email_id: str) -> dict:
 
 def get_quoted_text_from_db(email_id: str) -> str:
     """Recupera il quoted text salvato nel DB per una email."""
-    from database import get_client as get_db
     try:
         result = get_db().table("emails").select("quoted_text").eq("id", email_id).execute()
         if result.data:
