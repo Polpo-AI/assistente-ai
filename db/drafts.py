@@ -177,16 +177,22 @@ def claim_draft_for_sending(draft_id: str, from_status: str = DraftStatus.APPROV
     Ritorna True se questo processo ha vinto la gara (può inviare).
     Ritorna False se la bozza era già in un altro stato (qualcun altro l'ha presa).
     Questo impedisce il doppio invio quando Telegram e il watcher concorrono.
+
+    NOTA: richiede che 'sending' sia nei valori CHECK del DB (migration necessaria se non presente).
     """
-    db = get_client()
-    result = (
-        db.table("draft_responses")
-        .update({"status": DraftStatus.SENDING})
-        .eq("id", draft_id)
-        .eq("status", from_status)  # from_status è già un DraftStatus se chiamato correttamente
-        .execute()
-    )
-    return len(result.data) > 0
+    try:
+        db = get_client()
+        result = (
+            db.table("draft_responses")
+            .update({"status": DraftStatus.SENDING})
+            .eq("id", draft_id)
+            .eq("status", from_status)
+            .execute()
+        )
+        return len(result.data) > 0
+    except Exception as e:
+        logger.error("claim_draft_for_sending | draft_id=%s errore DB: %s", draft_id[:8], e)
+        return False
 
 
 def get_retriable_drafts(min_age_minutes: int = 10) -> list[dict]:
