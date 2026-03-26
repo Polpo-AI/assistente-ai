@@ -118,15 +118,18 @@ Lo staging NON si aggiorna automaticamente — va fatto `git pull` manuale sul V
 
 ## Bug noti / TODO prioritari
 
-| Priorità | Issue | File |
-|---|---|---|
-| Alta | Race condition deduplicazione message_id | `email_worker.py:608` |
-| Alta | `smtp_password` esposto nelle query | `database.py:443` |
-| Alta | Nessun connection pooling IMAP | `email_worker.py:335` |
-| Media | JSON parsing con regex → migrare a Pydantic | `responder.py`, `classifier.py` |
-| Media | `database.py` monolitico (757 righe) da splittare | `database.py` |
-| Media | `_doc_number()` collide al minuto | `document_generator.py:43` |
-| Bassa | Magic strings (intent, callback) → enum | vari file |
+| Priorità | Issue | File | Stato |
+|---|---|---|---|
+| Alta | Race condition deduplicazione message_id | `email_worker.py` | ✅ Risolto |
+| Alta | `smtp_password` esposto nelle query | `db/drafts.py` | ✅ Risolto |
+| Alta | Nessun connection pooling IMAP | `email_worker.py` | ✅ Risolto |
+| Alta | Double send race (Telegram + watcher) | `email_worker.py`, `telegram_bot.py` | ✅ Risolto |
+| Alta | `contact_type` sempre "sconosciuto" | `classifier.py` | ✅ Risolto |
+| Alta | Priority=1 draft stuck in send_failed | `email_worker.py`, `db/drafts.py` | ✅ Risolto |
+| Media | JSON parsing con regex → migrare a Pydantic | `responder.py`, `classifier.py` | ✅ Risolto |
+| Media | `database.py` monolitico (757 righe) da splittare | `db/` package | ✅ Risolto |
+| Media | `_doc_number()` collide al minuto | `document_generator.py` | ✅ Risolto |
+| Bassa | Magic strings → `DraftStatus` / `ClassifiedBy` enum | `constants.py` | ✅ Risolto |
 
 ---
 

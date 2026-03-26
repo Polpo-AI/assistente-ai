@@ -1,9 +1,10 @@
 """CRUD bozze e gestione stati draft_responses."""
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from .connection import get_client
+from constants import DraftStatus
 
 logger = logging.getLogger("polpo.database")
 
@@ -17,7 +18,7 @@ def save_draft(
     final_intent:      str,
     reclassified:      bool = False,
     warning:           Optional[str] = None,
-    status:            str = "pending",
+    status:            str = DraftStatus.PENDING,
     approved_by:       Optional[str] = None,
 ) -> dict:
     """Salva la bozza generata dal Responder."""
@@ -44,7 +45,7 @@ def approve_draft(draft_id: str, approved_by: str) -> dict:
     """Marca una bozza come approvata."""
     db = get_client()
     result = db.table("draft_responses").update({
-        "status":      "approved",
+        "status":      DraftStatus.APPROVED,
         "approved_by": approved_by,
         "approved_at": datetime.now(timezone.utc).isoformat(),
     }).eq("id", draft_id).execute()
@@ -55,7 +56,7 @@ def ignore_draft(draft_id: str) -> dict:
     """Marca una bozza come ignorata."""
     db = get_client()
     result = db.table("draft_responses").update({
-        "status": "ignored",
+        "status": DraftStatus.IGNORED,
     }).eq("id", draft_id).execute()
     return result.data[0]
 
@@ -82,7 +83,7 @@ def mark_email_no_reply(email_id: str, summary: str = "") -> dict:
         "client_id":   email_data["client_id"],
         "subject":     email_data["subject"],
         "body":        "[Nessuna risposta necessaria - Sistema Polpo AI]",
-        "status":      "sent",
+        "status":      DraftStatus.SENT,
         "final_intent": "cortesia",
         "warning":     summary or "Email automatica o di cortesia.",
     }
@@ -107,7 +108,7 @@ def mark_draft_failed(draft_id: str, error: str) -> None:
     """Marca una bozza come fallita (errore SMTP)."""
     try:
         get_client().table("draft_responses").update({
-            "status":     "send_failed",
+            "status":     DraftStatus.SEND_FAILED,
             "send_error": error[:500],
         }).eq("id", draft_id).execute()
     except Exception as e:
@@ -118,7 +119,7 @@ def mark_draft_sent(draft_id: str, sent_message_id: str = "") -> dict:
     """Marca una bozza come inviata, salva il Message-ID SMTP generato."""
     db = get_client()
     result = db.table("draft_responses").update({
-        "status":          "sent",
+        "status":          DraftStatus.SENT,
         "sent_at":         datetime.now(timezone.utc).isoformat(),
         "sent_message_id": sent_message_id,
     }).eq("id", draft_id).execute()
@@ -170,6 +171,40 @@ def update_draft_body(draft_id: str, subject: str, body: str) -> dict:
     return result.data[0]
 
 
+def claim_draft_for_sending(draft_id: str, from_status: str = DraftStatus.APPROVED) -> bool:
+    """Transizione atomica from_status → 'sending'.
+
+    Ritorna True se questo processo ha vinto la gara (può inviare).
+    Ritorna False se la bozza era già in un altro stato (qualcun altro l'ha presa).
+    Questo impedisce il doppio invio quando Telegram e il watcher concorrono.
+    """
+    db = get_client()
+    result = (
+        db.table("draft_responses")
+        .update({"status": DraftStatus.SENDING})
+        .eq("id", draft_id)
+        .eq("status", from_status)  # from_status è già un DraftStatus se chiamato correttamente
+        .execute()
+    )
+    return len(result.data) > 0
+
+
+def get_retriable_drafts(min_age_minutes: int = 10) -> list[dict]:
+    """Bozze in 'send_failed' ferme da almeno min_age_minutes — pronte per un retry."""
+    db = get_client()
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=min_age_minutes)).isoformat()
+    result = (
+        db.table("draft_responses")
+        .select("id, client_id, subject, body, email_id, telegram_message_id, "
+                "emails(sender_email, sender_name, subject, message_id), "
+                "clients(smtp_host, smtp_port, smtp_user, smtp_password, name, telegram_chat_id)")
+        .eq("status", DraftStatus.SEND_FAILED)
+        .lte("updated_at", cutoff)
+        .execute()
+    )
+    return result.data
+
+
 def get_approved_drafts() -> list[dict]:
     """Cerca bozze approvate che devono essere inviate."""
     db = get_client()
@@ -178,7 +213,7 @@ def get_approved_drafts() -> list[dict]:
         .select("id, client_id, subject, body, email_id, telegram_message_id, "
                 "emails(sender_email, sender_name, subject, message_id), "
                 "clients(smtp_host, smtp_port, smtp_user, smtp_password, name, telegram_chat_id)")
-        .eq("status", "approved")
+        .eq("status", DraftStatus.APPROVED)
         .execute()
     )
     return result.data

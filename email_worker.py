@@ -36,7 +36,8 @@ import aioimaplib
 import aiosmtplib
 from dotenv import load_dotenv
 
-from database import get_client as get_db, mark_email_no_reply, mark_draft_generation_failed, get_approved_drafts
+from database import get_client as get_db, mark_email_no_reply, mark_draft_generation_failed, get_approved_drafts, claim_draft_for_sending, get_retriable_drafts
+from constants import DraftStatus
 from classifier import classify_message, InboundMessage
 from responder import generate_response_draft
 import telegram_bot
@@ -258,22 +259,6 @@ def update_last_uid(client_id: str, uid: int) -> None:
     get_db().table("clients").update({"imap_last_uid": uid}).eq("id", client_id).execute()
 
 
-from database import get_approved_drafts
-
-
-def mark_draft_sent(draft_id: str, sent_message_id: str) -> None:
-    get_db().table("draft_responses").update({
-        "status":          "sent",
-        "sent_at":         datetime.now(timezone.utc).isoformat(),
-        "sent_message_id": sent_message_id,
-    }).eq("id", draft_id).execute()
-
-
-def mark_draft_failed(draft_id: str, error: str) -> None:
-    get_db().table("draft_responses").update({
-        "status":     "send_failed",
-        "send_error": error[:500],
-    }).eq("id", draft_id).execute()
 
 
 def save_email_enrichments(
@@ -938,13 +923,25 @@ async def approved_watcher_loop() -> None:
 
     while True:
         try:
-            approved = await asyncio.to_thread(get_approved_drafts)
-            if approved:
-                logger.info("worker.approved | %d bozze da inviare", len(approved))
-                await asyncio.gather(
-                    *[send_email_smtp(draft) for draft in approved],
-                    return_exceptions=True,
-                )
+            approved   = await asyncio.to_thread(get_approved_drafts)
+            retriable  = await asyncio.to_thread(get_retriable_drafts)
+
+            candidates = [(d, DraftStatus.APPROVED) for d in approved] + [(d, DraftStatus.SEND_FAILED) for d in retriable]
+            if candidates:
+                logger.info("worker.approved | %d approvate, %d da ritentare", len(approved), len(retriable))
+
+            async def _claim_and_send(draft: dict, from_status: str) -> None:
+                draft_id = draft["id"]
+                claimed = await asyncio.to_thread(claim_draft_for_sending, draft_id, from_status)
+                if not claimed:
+                    logger.debug("worker.approved | draft_id=%s già presa — skip", draft_id[:8])
+                    return
+                await send_email_smtp(draft)
+
+            await asyncio.gather(
+                *[_claim_and_send(d, s) for d, s in candidates],
+                return_exceptions=True,
+            )
         except Exception as e:
             logger.error("worker.approved | Errore generale: %s", e)
 

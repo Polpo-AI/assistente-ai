@@ -29,6 +29,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 from dotenv import load_dotenv
 from database import get_client, get_conversation_history, save_draft, get_draft_by_id, update_draft_body
 from client_config import ClientConfig, get_client_config
+from constants import ClassifiedBy, DraftStatus
 
 load_dotenv()
 
@@ -397,7 +398,7 @@ def generate_response_draft(
 
     needs_reclassification = (
         ctx.intent == "altro"
-        or ctx.classified_by == "llm_fallback"
+        or ctx.classified_by == ClassifiedBy.LLM_FALLBACK
         or ctx.confidence < reclassify_threshold
     )
 
@@ -465,10 +466,10 @@ def generate_response_draft(
             attachment_filename = None
 
     # ── Step 5: Salva bozza nel DB ────────────────────
-    draft_status = "pending"
+    draft_status = DraftStatus.PENDING
     approved_by = None
     if ctx.priority == 1:
-        draft_status = "approved"
+        draft_status = DraftStatus.APPROVED
         approved_by = "system_auto"
 
     draft_id = None

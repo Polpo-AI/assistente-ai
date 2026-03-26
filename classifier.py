@@ -43,6 +43,7 @@ from dotenv import load_dotenv
 from database import persist_classified_email, get_contact_by_email
 from client_config import ClientConfig, get_client_config
 from attachment_reader import get_quoted_text_from_db
+from constants import ClassifiedBy
 
 load_dotenv()
 logger = logging.getLogger("polpo.classifier")
@@ -111,7 +112,7 @@ def _is_trivial(
     if any(re.search(p, sender) for p in NOREPLY_PATTERNS):
         return ClassificationResult(
             contact_type="sconosciuto", intent="cortesia", priority=0,
-            confidence=0.99, classified_by="filter",
+            confidence=0.99, classified_by=ClassifiedBy.FILTER,
             summary="Mittente automatico o noreply — nessuna risposta necessaria.",
         )
 
@@ -127,7 +128,7 @@ def _is_trivial(
             and "?" not in body_clean):
         return ClassificationResult(
             contact_type="sconosciuto", intent="cortesia", priority=0,
-            confidence=0.95, classified_by="filter",
+            confidence=0.95, classified_by=ClassifiedBy.FILTER,
             summary="Messaggio di cortesia non azionabile — nessuna risposta necessaria.",
         )
 
@@ -154,7 +155,7 @@ class ClassificationResult:
     intent:          str            # intent dell'email CORRENTE
     priority:        int            # 0=no reply, 1=bassa, 2=media, 3=urgente
     confidence:      float
-    classified_by:   str            # "filter" | "llm" | "llm_fallback"
+    classified_by:   str            # ClassifiedBy.FILTER | LLM | LLM_FALLBACK | NONE
     summary:         str            # descrive l'intent corrente, non il thread
     estimated_value: Optional[float] = None
     thread_topic:    str = ""
@@ -279,7 +280,7 @@ Allegati: {att_names}{contact_block}
             intent=intent,
             priority=payload.priority,
             confidence=payload.confidence,
-            classified_by="llm",
+            classified_by=ClassifiedBy.LLM,
             summary=payload.summary,
             estimated_value=payload.estimated_value,
         )
@@ -290,14 +291,14 @@ Allegati: {att_names}{contact_block}
         logger.warning("llm_classify | parsing fallito: %s | raw=%s", e, raw[:100])
         return ClassificationResult(
             contact_type="sconosciuto", intent="altro", priority=2,
-            confidence=0.3, classified_by="llm_fallback",
+            confidence=0.3, classified_by=ClassifiedBy.LLM_FALLBACK,
             summary="Classificazione LLM fallita, richiede revisione manuale."
             )
     except Exception as e:
         logger.error("llm_classify | Errore inatteso: %s", e)
         return ClassificationResult(
             contact_type="sconosciuto", intent="altro", priority=2,
-            confidence=0.0, classified_by="llm_fallback",
+            confidence=0.0, classified_by=ClassifiedBy.LLM_FALLBACK,
             summary="Errore LLM, richiede revisione manuale."
             )
 
@@ -355,13 +356,15 @@ def classify_message(
             )
 
             # Il contact_type dal DB ha sempre precedenza su quello inferito dall'LLM
+            if contact_type_hint:
+                result.contact_type = contact_type_hint
 
         else:
             logger.warning("classify | client=%s email=%s — nessun LLM disponibile",
                            client_id[:8], msg.sender_email)
             result = ClassificationResult(
                 contact_type="sconosciuto", intent="altro", priority=2,
-                confidence=0.0, classified_by="none",
+                confidence=0.0, classified_by=ClassifiedBy.NONE,
                 summary="Classificazione non riuscita. Richiede revisione manuale."
             )
 

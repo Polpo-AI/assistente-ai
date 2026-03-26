@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 from .connection import get_client
 from .contacts import get_contact_by_email
+from constants import DraftStatus
 
 logger = logging.getLogger("polpo.database")
 
@@ -82,7 +83,7 @@ def q_drafts_sent_in_range(client_id: str, date_from: str, date_to: str, limit: 
         db.table("draft_responses")
         .select("id, sent_at, subject, body, final_intent, status")
         .eq("client_id", client_id)
-        .eq("status", "sent")
+        .eq("status", DraftStatus.SENT)
         .gte("sent_at", f"{date_from}T00:00:00Z")
         .lte("sent_at", f"{date_to}T23:59:59Z")
         .order("sent_at", desc=True)
@@ -99,7 +100,7 @@ def q_pending_older_than(client_id: str, hours: int, limit: int = 20) -> list[di
         db.table("draft_responses")
         .select("*")
         .eq("client_id", client_id)
-        .eq("status", "pending")
+        .eq("status", DraftStatus.PENDING)
         .lte("created_at", cutoff)
         .order("created_at", desc=True)
         .limit(limit)

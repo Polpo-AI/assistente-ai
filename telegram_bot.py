@@ -45,7 +45,9 @@ from database import (
     set_pending_edit,
     get_pending_edit,
     clear_pending_edit,
+    claim_draft_for_sending,
 )
+from constants import DraftStatus
 from smtp_sender import send_email_smtp
 from attachment_reader import extract_pending_attachment
 from responder import refine_draft
@@ -353,6 +355,10 @@ async def _send_and_update_card(draft: dict, chat_id: int, message_id: int) -> N
     Il worker SMTP periodico skipperà questa draft (già in stato 'sent' o 'send_failed').
     """
     draft_id = draft["id"]
+    claimed = await asyncio.to_thread(claim_draft_for_sending, draft_id, DraftStatus.APPROVED)
+    if not claimed:
+        logger.info("_send_and_update_card | draft_id=%s già presa dal watcher — skip", draft_id[:8])
+        return
     try:
         await send_email_smtp(draft)  # aiosmtplib — async nativo, await diretto
         await _edit_message(chat_id, message_id, _format_message(draft) + "\n\n📨 *Email inviata!*")
@@ -387,13 +393,13 @@ async def _handle_callback(cq: dict) -> None:
         return
 
     # Gestione conflitti: bozza già gestita — aggiorna la card con lo stato reale
-    if draft.get("status") != "pending":
+    if draft.get("status") != DraftStatus.PENDING:
         status = draft.get("status", "")
         status_labels = {
-            "approved":  "⏳ Invio in corso...",
-            "sent":      "📨 Email inviata!",
-            "ignored":   "🗑 Email ignorata.",
-            "send_failed": "❌ Invio fallito — verifica le credenziali SMTP o riprova dalla dashboard.",
+            DraftStatus.APPROVED:    "⏳ Invio in corso...",
+            DraftStatus.SENT:        "📨 Email inviata!",
+            DraftStatus.IGNORED:     "🗑 Email ignorata.",
+            DraftStatus.SEND_FAILED: "❌ Invio fallito — verifica le credenziali SMTP o riprova dalla dashboard.",
         }
         label = status_labels.get(status, f"⚠️ Già gestita ({status}).")
         await _edit_message(chat_id, message_id, _format_message(draft) + f"\n\n{label}")

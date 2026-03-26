@@ -13,6 +13,7 @@ import logging
 from typing import Optional, List
 from anthropic import Anthropic
 from models_config import SUMMARIZER_MODEL
+from constants import DraftStatus
 from duckduckgo_search import DDGS
 
 import database as db
@@ -325,10 +326,10 @@ def dispatch(tool_name: str, tool_input: dict, client_id: str, anthropic_client:
         elif tool_name == "change_draft_status":
             draft_id = tool_input["draft_id"]
             new_status = tool_input["new_status"]
-            if new_status == "approved":
+            if new_status == DraftStatus.APPROVED:
                 db.approve_draft(draft_id, "telegram_bot")
                 return f"Bozza {draft_id[:8]} approvata e messa in coda d'invio."
-            elif new_status == "ignored":
+            elif new_status == DraftStatus.IGNORED:
                 db.ignore_draft(draft_id)
                 return f"Bozza {draft_id[:8]} ignorata."
             else:
@@ -347,7 +348,7 @@ def dispatch(tool_name: str, tool_input: dict, client_id: str, anthropic_client:
             existing = db.get_client().table("draft_responses") \
                 .select("id, status") \
                 .eq("email_id", email_id) \
-                .in_("status", ["pending", "approved"]) \
+                .in_("status", [DraftStatus.PENDING, DraftStatus.APPROVED]) \
                 .limit(1).execute()
             if existing.data:
                 s = existing.data[0]["status"]
