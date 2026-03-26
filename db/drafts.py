@@ -199,7 +199,7 @@ def get_retriable_drafts(min_age_minutes: int = 10) -> list[dict]:
                 "emails(sender_email, sender_name, subject, message_id), "
                 "clients(smtp_host, smtp_port, smtp_user, smtp_password, name, telegram_chat_id)")
         .eq("status", DraftStatus.SEND_FAILED)
-        .lte("updated_at", cutoff)
+        .lte("created_at", cutoff)   # updated_at non esiste — usiamo created_at come proxy
         .execute()
     )
     return result.data
