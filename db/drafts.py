@@ -41,15 +41,15 @@ def save_draft(
     return result.data[0]
 
 
-def approve_draft(draft_id: str, approved_by: str) -> dict:
-    """Marca una bozza come approvata."""
+def approve_draft(draft_id: str, approved_by: str) -> Optional[dict]:
+    """Marca una bozza come approvata. Ritorna None se non trovata."""
     db = get_client()
     result = db.table("draft_responses").update({
         "status":      DraftStatus.APPROVED,
         "approved_by": approved_by,
         "approved_at": datetime.now(timezone.utc).isoformat(),
     }).eq("id", draft_id).execute()
-    return result.data[0]
+    return result.data[0] if result.data else None
 
 
 def ignore_draft(draft_id: str) -> dict:

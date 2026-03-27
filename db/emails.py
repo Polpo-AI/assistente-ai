@@ -19,9 +19,10 @@ def save_email(
     attachments:     list[str],
     contact_id:      Optional[str] = None,
     conversation_id: Optional[str] = None,
+    message_id:      Optional[str] = None,
 ) -> dict:
     db = get_client()
-    result = db.table("emails").insert({
+    data = {
         "client_id":       client_id,
         "sender_email":    sender_email.lower(),
         "sender_name":     sender_name,
@@ -31,7 +32,10 @@ def save_email(
         "contact_id":      contact_id,
         "conversation_id": conversation_id,
         "received_at":     datetime.now(timezone.utc).isoformat(),
-    }).execute()
+    }
+    if message_id:
+        data["message_id"] = message_id
+    result = db.table("emails").insert(data).execute()
     return result.data[0]
 
 
@@ -81,14 +85,33 @@ def persist_classified_email(
     summary:         str,
     estimated_value: Optional[float] = None,
     in_reply_to:     str = "",
+    message_id:      Optional[str] = None,
 ) -> dict:
     """
     Pipeline salvataggio completa:
-    1. Upsert contatto
-    2. Trova o crea conversazione (via RFC822 in_reply_to se disponibile)
-    3. Salva email
-    4. Salva classificazione
+    1. Dedup per message_id (se fornito)
+    2. Upsert contatto
+    3. Trova o crea conversazione (via RFC822 in_reply_to se disponibile)
+    4. Salva email
+    5. Salva classificazione
     """
+    db = get_client()
+
+    # Dedup: se message_id già presente, ritorna i db_ids esistenti senza duplicare
+    if message_id:
+        existing = db.table("emails").select("id, contact_id, conversation_id").eq("message_id", message_id).execute()
+        if existing.data:
+            row = existing.data[0]
+            logger.info("persist_classified_email | dedup message_id=%s — email già presente: %s", message_id[:30], row["id"][:8])
+            existing_cls = db.table("email_classifications").select("id").eq("email_id", row["id"]).execute()
+            return {
+                "client_id":         client_id,
+                "contact_id":        row.get("contact_id"),
+                "conversation_id":   row.get("conversation_id"),
+                "email_id":          row["id"],
+                "classification_id": existing_cls.data[0]["id"] if existing_cls.data else None,
+            }
+
     contact = upsert_contact(client_id, sender_email, sender_name, contact_type)
     contact_id = contact["id"]
 
@@ -104,6 +127,7 @@ def persist_classified_email(
         attachments=attachments,
         contact_id=contact_id,
         conversation_id=conversation_id,
+        message_id=message_id,
     )
     email_id = email_record["id"]
 

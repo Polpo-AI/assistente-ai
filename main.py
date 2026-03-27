@@ -82,6 +82,7 @@ class IncomingEmail(BaseModel):
     subject:      str
     body:         str
     attachments:  list[str] = []
+    message_id:   Optional[str] = None   # MIME Message-ID per deduplicazione
 
 class ApproveRequest(BaseModel):
     approved_by: str  # nome/email di chi approva
@@ -129,6 +130,7 @@ async def classify(email: IncomingEmail):
         subject=email.subject,
         body=email.body,
         attachments=email.attachments,
+        message_id=email.message_id or "",
     )
 
     try:
@@ -223,8 +225,12 @@ def approve(draft_id: str, body: ApproveRequest):
     Cambia lo status da 'pending' ad 'approved'.
     """
     try:
-        approve_draft(draft_id, body.approved_by)
+        result = approve_draft(draft_id, body.approved_by)
+        if not result:
+            raise HTTPException(status_code=404, detail="Bozza non trovata")
         return {"status": "approved", "draft_id": draft_id, "approved_by": body.approved_by}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

@@ -148,6 +148,7 @@ class InboundMessage:
     attachments:       list[str] = field(default_factory=list)
     detected_language: str = "unknown"
     in_reply_to:       str = ""    # header RFC822 per threading corretto
+    message_id:        str = ""    # MIME Message-ID per deduplicazione
 
 @dataclass
 class ClassificationResult:
@@ -386,6 +387,7 @@ def classify_message(
                 summary=result.summary,
                 estimated_value=result.estimated_value,
                 in_reply_to=msg.in_reply_to,
+                message_id=msg.message_id or None,
             )
             result.db_ids = db_ids
             logger.info("classify | DB — email_id=%s intent=%s priority=%d",
