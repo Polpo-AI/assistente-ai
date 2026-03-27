@@ -351,7 +351,9 @@ async def _fetch_new_emails_imap_inner(client: dict) -> list[dict]:
     try:
         await imap.wait_hello_from_server()
         imap_password = client["imap_password"] or ""
-        await imap.login(client["imap_user"], imap_password)
+        typ, data = await imap.login(client["imap_user"], imap_password)
+        if typ != "OK":
+            raise ValueError(f"Login IMAP fallito ({typ}): {data}")
         logger.info("worker.imap | [%s] Login effettuato", client["name"])
 
         # ── Calibrazione silenziosa al primo avvio ──────────────────────
